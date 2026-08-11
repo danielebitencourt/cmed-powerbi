@@ -1,0 +1,6 @@
+numpy
+pandas
+requests
+PyYAML
+beautifulsoup4
+openpyxl
