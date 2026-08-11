@@ -1,0 +1,19 @@
+# ── Dados brutos baixados da ANVISA (recriáveis; não versionar) ──
+dados/raw/
+ 
+# ── Histórico antigo em CSV (substituído pelo Parquet particionado
+#    em dados/processed/fato/). Se você tiver commits antigos com CSVs
+#    gigantes, veja as instruções para limpar o histórico do git. ──
+dados/historico/
+ 
+# ── Logs e artefatos de depuração ──
+logs/
+*.log
+cmed_pagina_debug.html
+ 
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
