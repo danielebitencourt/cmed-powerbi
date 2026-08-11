@@ -1,7 +1,11 @@
-numpy
-pandas
-requests
-PyYAML
-beautifulsoup4
-openpyxl
-xlrd
+# Versões fixadas para builds reproduzíveis no GitHub Actions.
+# Sem fixar, o CI instala sempre a versão mais nova e pode quebrar por
+# incompatibilidade (ex.: numpy 2.x com pandas antigo) — algo que não
+# acontece localmente porque sua máquina já tem versões em cache.
+numpy==1.26.4
+pandas==2.2.2
+requests==2.32.3
+PyYAML==6.0.2
+beautifulsoup4==4.12.3
+openpyxl==3.1.5
+xlrd==2.0.1
