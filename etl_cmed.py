@@ -1029,52 +1029,46 @@ def exportar_para_powerbi(
     modo_historico: bool = True,
 ) -> dict:
     """
-    Exporta DataFrames para CSV (utf-8-sig) prontos para o Power BI.
-    Se modo_historico=True, faz append à tabela fato existente.
+    Exporta dados prontos para o Power BI.
+
+    A tabela FATO é gravada em Parquet PARTICIONADO POR COMPETÊNCIA
+    (um arquivo por mês em dados/processed/fato/). Motivos:
+      • Parquet comprime muito dados repetitivos (377 MB de CSV ≈ 20-40 MB),
+        ficando bem abaixo do limite de 100 MB por arquivo do GitHub.
+      • Particionar por mês evita um arquivo único que cresce sem parar.
+      • O Power BI lê uma pasta de Parquet nativamente ("Pasta" → Combinar).
+    As DIMENSÕES continuam em CSV (são pequenas) e são acumuladas/dedupadas.
     """
     dir_saida = Path(diretorio)
     dir_saida.mkdir(parents=True, exist_ok=True)
-
     encoding = "utf-8-sig"  # compatível com Excel e Power BI
     arquivos = {}
 
-    # ── Fato: append (histórico) ───────────────────────────────────
-    caminho_fato = dir_saida / "fato_precos.csv"
-    if modo_historico and caminho_fato.exists():
-        df_existente = pd.read_csv(caminho_fato, dtype=str, encoding=encoding)
-        # Evitar duplicatas pela combinação EAN+UF+TIPO+COMPETENCIA+ALIQUOTA
-        chave = ["EAN", "ESTADO_UF", "TIPO_PRECO", "COMPETENCIA", "ALIQUOTA_ICMS"]
-        chaves_existentes = set(
-            df_existente[chave].apply(lambda r: "|".join(str(v) for v in r), axis=1)
-        )
-        mask_novos = df_fato[chave].apply(
-            lambda r: "|".join(str(v) for v in r), axis=1
-        ).apply(lambda x: x not in chaves_existentes)
-        df_novos = df_fato[mask_novos]
-        if len(df_novos) > 0:
-            df_final = pd.concat([df_existente, df_novos], ignore_index=True)
-            logging.info(
-                f"Histórico: {len(df_novos)} registros novos adicionados "
-                f"(total: {len(df_final)})."
-            )
-        else:
-            df_final = df_existente
-            logging.info("Nenhum registro novo — dados já existem no histórico.")
+    # ── FATO: Parquet, um arquivo por competência ──────────────────
+    dir_fato = dir_saida / "fato"
+    dir_fato.mkdir(parents=True, exist_ok=True)
+
+    if "COMPETENCIA" in df_fato.columns and len(df_fato) > 0:
+        competencias = sorted(df_fato["COMPETENCIA"].dropna().unique())
     else:
-        df_final = df_fato
+        competencias = []
 
-    df_final.to_csv(caminho_fato, index=False, encoding=encoding)
-    arquivos["fato_precos"] = caminho_fato
+    for comp in competencias:
+        parte = df_fato[df_fato["COMPETENCIA"] == comp]
+        caminho_parte = dir_fato / f"fato_precos_{comp}.parquet"
+        # Sobrescreve o mês (idempotente entre as execuções do mesmo mês).
+        parte.to_parquet(caminho_parte, index=False, engine="pyarrow", compression="snappy")
+        arquivos[f"fato_precos_{comp}"] = caminho_parte
 
-    # ── Dimensões (sobrescrever — são estáticas/acumulativas) ──────
+    if not competencias:
+        logging.warning("Tabela fato vazia — nenhum Parquet gerado.")
+
+    # ── Dimensões (CSV, acumuladas/dedupadas) ──────────────────────
     caminho_med = dir_saida / "dim_medicamento.csv"
     if caminho_med.exists():
         df_med_existente = pd.read_csv(caminho_med, dtype=str, encoding=encoding)
-        df_medicamento = pd.concat(
-            [df_med_existente, df_medicamento], ignore_index=True
-        )
+        df_medicamento = pd.concat([df_med_existente, df_medicamento], ignore_index=True)
         df_medicamento.drop_duplicates(subset=["EAN"], keep="last", inplace=True)
-
     df_medicamento.to_csv(caminho_med, index=False, encoding=encoding)
     arquivos["dim_medicamento"] = caminho_med
 
@@ -1088,7 +1082,8 @@ def exportar_para_powerbi(
 
     for nome, caminho in arquivos.items():
         tam = Path(caminho).stat().st_size
-        logging.info(f"Exportado: {caminho} ({tam:,} bytes)")
+        aviso = "  ⚠ ACIMA DE 100MB!" if tam > 100 * 1024 * 1024 else ""
+        logging.info(f"Exportado: {caminho} ({tam:,} bytes){aviso}")
 
     return arquivos
 
@@ -1157,17 +1152,9 @@ def main():
             config["diretorio_saida"],
         )
 
-        # 8. Backup histórico
-        dir_hist = Path(config["diretorio_historico"])
-        dir_hist.mkdir(parents=True, exist_ok=True)
         competencia = extrair_competencia_do_arquivo(arquivo_pmc)
-        for nome, caminho in arquivos.items():
-            backup = dir_hist / f"{nome}_{competencia}.csv"
-            import shutil
-            shutil.copy2(caminho, backup)
-            logging.info(f"Backup: {backup}")
 
-        # 9. Registrar estado (última execução bem-sucedida).
+        # 8. Registrar estado (última execução bem-sucedida).
         estado.update({
             "ultima_competencia": competencia,
             "ultima_execucao": datetime.now().isoformat(),
