@@ -744,10 +744,24 @@ def gerar_dimensao_estado() -> pd.DataFrame:
 
 def gerar_dimensao_calendario(
     data_inicio: str = "2024-01-01",
-    data_fim: str = "2027-12-31",
 ) -> pd.DataFrame:
-    """Gera tabela dimensão dCalendario."""
+    """Gera tabela dimensão dCalendario automaticamente até o fim do próximo ano."""
+
+    ano_atual = datetime.now().year
+    data_fim = f"{ano_atual + 1}-12-31"
+
     datas = pd.date_range(start=data_inicio, end=data_fim, freq="D")
+
+    df = pd.DataFrame({"DATA": datas})
+    df["ANO"] = df["DATA"].dt.year
+    df["MES"] = df["DATA"].dt.month
+    df["NOME_MES"] = df["DATA"].dt.strftime("%B").str.capitalize()
+    df["TRIMESTRE"] = df["DATA"].dt.quarter
+    df["COMPETENCIA"] = df["DATA"].dt.strftime("%Y-%m")
+    df["DATA"] = df["DATA"].dt.strftime("%Y-%m-%d")
+
+    return df
+
     df = pd.DataFrame({"DATA": datas})
     df["ANO"] = df["DATA"].dt.year
     df["MES"] = df["DATA"].dt.month
