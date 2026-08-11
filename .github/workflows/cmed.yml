@@ -60,10 +60,11 @@ jobs:
           # Os .xlsx crus, logs e histórico ficam de fora via .gitignore.
           git add dados/processed .github/cmed/estado.json 2>/dev/null || true
 
-          # Trava de segurança: aborta se algo com mais de 100 MB entrou no stage.
-          GRANDES=$(git diff --cached --name-only | while read f; do
-            [ -f "$f" ] && sz=$(stat -c%s "$f" 2>/dev/null || echo 0) || sz=0
-            [ "$sz" -gt 104857600 ] && echo "$f ($sz bytes)"
+          # Trava de segurança: lista arquivos staged acima de 100 MB.
+          # 'find -size +100M' retorna 0 mesmo sem correspondência, então é
+          # seguro sob 'bash -e'. O '|| true' protege caminhos inexistentes.
+          GRANDES=$(git diff --cached --name-only | while IFS= read -r f; do
+            [ -f "$f" ] && find "$f" -size +100M 2>/dev/null || true
           done)
           if [ -n "$GRANDES" ]; then
             echo "::error::Arquivo(s) acima de 100MB no commit — abortando:"
