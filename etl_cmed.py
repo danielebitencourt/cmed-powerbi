@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import smtplib
+import socket
 import sys
 import time
 from datetime import datetime
@@ -52,6 +53,7 @@ CONFIG_PADRAO = {
     "timeout_segundos": 90,
     "tentativas_max": 3,
     "intervalo_retry_segundos": 30,
+    "forcar_ipv4": True,
     "user_agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -242,6 +244,37 @@ def calcular_hash_arquivo(caminho: Path) -> str:
     return sha.hexdigest()
 
 
+def forcar_ipv4() -> None:
+    """
+    Força todas as conexões HTTP a usarem IPv4.
+
+    No GitHub Actions o runner normalmente NÃO tem rota IPv6 de saída. Como o
+    gov.br publica endereço IPv6 (registro AAAA), o requests pode tentar IPv6
+    e falhar com '[Errno 101] Network is unreachable'. Localmente isso não
+    ocorre. Restringir a resolução de nomes a IPv4 resolve o problema.
+    """
+    # Caminho 1 (preferido): urllib3 respeita allowed_gai_family.
+    try:
+        import urllib3.util.connection as urllib3_cn
+
+        def _somente_ipv4():
+            return socket.AF_INET
+
+        urllib3_cn.allowed_gai_family = _somente_ipv4
+    except Exception as e:  # pragma: no cover
+        logging.debug(f"Não foi possível ajustar urllib3 para IPv4: {e}")
+
+    # Caminho 2 (reforço): filtra getaddrinfo para AF_INET no processo todo.
+    _orig_getaddrinfo = socket.getaddrinfo
+
+    def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+        resultados = _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+        return resultados or _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+    socket.getaddrinfo = _getaddrinfo_ipv4
+    logging.info("Rede: conexões restritas a IPv4 (evita ENETUNREACH no CI).")
+
+
 def criar_sessao_http(config: dict) -> requests.Session:
     """
     Cria uma sessão HTTP com retry automático a nível de conexão.
@@ -252,6 +285,9 @@ def criar_sessao_http(config: dict) -> requests.Session:
     acontecem na sua máquina local.
     """
     from requests.adapters import HTTPAdapter
+
+    if config.get("forcar_ipv4", True):
+        forcar_ipv4()
 
     try:
         from urllib3.util.retry import Retry
@@ -330,7 +366,7 @@ def obter_links_cmed(config: dict) -> dict:
     sessao = config.get("_sessao") or criar_sessao_http(config)
 
     logging.info(f"Acessando página CMED: {url}")
-    resp = sessao.get(url, timeout=timeout, verify=True)
+    resp = sessao.get(url, timeout=(20, timeout), verify=True)
     if resp.status_code != 200:
         # Diagnóstico: no CI, gov.br costuma devolver 403 (bloqueio de WAF/IP
         # de datacenter). O trecho abaixo ajuda a distinguir bloqueio de bug.
@@ -343,8 +379,14 @@ def obter_links_cmed(config: dict) -> dict:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
+    def desescapar(s: str) -> str:
+        # Links vindos de blocos JSON/JS trazem barras escapadas: \u002F, \/ etc.
+        s = s.replace("\\/", "/")
+        s = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
+        return s.strip()
+
     def absolutizar(href: str) -> str:
-        href = href.strip()
+        href = desescapar(href)
         if href.startswith("http"):
             return href
         if href.startswith("//"):
@@ -488,7 +530,7 @@ def baixar_arquivo_cmed(
             logging.info(
                 f"Download {tipo} — tentativa {tentativa}/{tentativas}: {url}"
             )
-            resp = sessao.get(url, headers=headers, timeout=timeout, stream=True)
+            resp = sessao.get(url, headers=headers, timeout=(20, timeout), stream=True)
             resp.raise_for_status()
 
             # A URL de origem pode ser "resolveuid/<uuid>" (sem data). Descobrimos
