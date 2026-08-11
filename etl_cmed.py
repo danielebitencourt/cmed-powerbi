@@ -1,29 +1,27 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
 ETL CMED — Extração, Transformação e Carga de dados ANVISA/CMED para Power BI.
 
-Arquitetura preparada para GitHub Actions:
+Automatiza o download mensal das tabelas oficiais de preços de medicamentos
+(PMC e PF/PMVG), aplica tratamentos de qualidade e exporta em formato
+pronto para consumo pelo Power BI via Gateway de Dados.
 
-- Descobre automaticamente os arquivos PMC e PMVG publicados pela CMED.
-- Usa a página oficial de arquivos da CMED.
-- Não depende de nomes fixos dos arquivos.
-- Baixa os arquivos e calcula SHA-256.
-- Mantém o estado de processamento separado dos dados de negócio.
-- Usa competência + hashes para detectar mudanças.
-- Não depende de fato_precos.csv para decidir se deve processar.
-- Mantém histórico dos dados em CSV.
-- Gera dimensões para consumo pelo Power BI.
+Uso:
+    python etl_cmed.py                  # execução padrão
+    python etl_cmed.py --config config.yaml   # configuração customizada
+    python etl_cmed.py --competencia 2026-07  # forçar competência específica
+
+Autor: Automação CMED × Power BI
+Licença: Uso interno
 """
 
 import argparse
 import hashlib
 import json
 import logging
+import os
 import re
-import shutil
 import smtplib
 import sys
 import time
@@ -32,7 +30,6 @@ from email.mime.text import MIMEText
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urljoin, urlparse
 
 import numpy as np
 import pandas as pd
@@ -40,16 +37,12 @@ import requests
 import yaml
 from bs4 import BeautifulSoup
 
-
-# ============================================================================
-# CONFIGURAÇÃO
-# ============================================================================
+# ═══════════════════════════════════════════════════════════════════════
+# CONFIGURAÇÕES PADRÃO
+# ═══════════════════════════════════════════════════════════════════════
 
 CONFIG_PADRAO = {
-    "url_cmed": (
-        "https://www.gov.br/anvisa/pt-br/assuntos/"
-        "medicamentos/cmed/precos/arquivos"
-    ),
+    "url_cmed": "https://www.gov.br/anvisa/pt-br/assuntos/medicamentos/cmed/precos",
     "diretorio_saida": "dados/processed",
     "diretorio_raw": "dados/raw",
     "diretorio_historico": "dados/historico",
@@ -73,89 +66,57 @@ CONFIG_PADRAO = {
     },
 }
 
-
-# ============================================================================
-# ICMS
-# ============================================================================
+# ═══════════════════════════════════════════════════════════════════════
+# MAPEAMENTO ICMS → UF  (Resolução CM-CMED nº 2/2024 + atualizações)
+# ═══════════════════════════════════════════════════════════════════════
 
 MAPEAMENTO_ICMS_UF = {
-    "0%": [
-        "AC", "AM", "AP", "PA", "RO", "RR", "TO",
-        "MT", "MS", "GO", "DF"
-    ],
-    "12%": ["ES", "RS"],
-    "17%": [
-        "AL", "BA", "CE", "MA", "PB", "PE", "PI",
-        "RN", "SE", "PR", "SC", "SP"
-    ],
+    "0%":    ["AC", "AM", "AP", "PA", "RO", "RR", "TO", "MT", "MS", "GO", "DF"],
+    "12%":   ["ES", "RS"],
+    "17%":   ["AL", "BA", "CE", "MA", "PB", "PE", "PI", "RN", "SE", "PR", "SC", "SP"],
     "17,5%": ["RJ"],
-    "18%": ["MG"],
-    "19,5%": [],
-    "20%": [],
+    "18%":   ["MG"],
+    "19,5%": [],  # Preencher conforme legislação vigente no momento da carga
+    "20%":   [],
     "20,5%": [],
-    "21%": [],
-    "22%": [],
+    "21%":   [],
+    "22%":   [],
 }
 
-
-# ============================================================================
-# COLUNAS
-# ============================================================================
+# Colunas de preço esperadas no arquivo PMC/PF
+# A CMED pode alterar a quantidade de alíquotas e inserir espaços antes do "%".
+# Por isso, estas listas são mantidas apenas como referência; a seleção real
+# das colunas é feita dinamicamente por detectar_colunas_preco().
+COLUNAS_PF = ["PF Sem Impostos", "PF 0%", "PF 12%", "PF 17%", "PF 17,5%", "PF 18%", "PF 19%", "PF 19,5%", "PF 20%", "PF 20,5%", "PF 21%", "PF 22%", "PF 22,5%", "PF 23%"]
+COLUNAS_PMC = ["PMC Sem Impostos", "PMC 0%", "PMC 12%", "PMC 17%", "PMC 17,5%", "PMC 18%", "PMC 19%", "PMC 19,5%", "PMC 20%", "PMC 20,5%", "PMC 21%", "PMC 22%", "PMC 22,5%", "PMC 23%"]
 
 COLUNAS_IDENTIFICACAO = [
-    "SUBSTÂNCIA",
-    "CNPJ",
-    "LABORATÓRIO",
-    "CÓDIGO GGREM",
-    "REGISTRO",
-    "EAN 1",
-    "EAN 2",
-    "EAN 3",
-    "PRODUTO",
-    "APRESENTAÇÃO",
-    "F.FARMACÊUTICA",
-    "CLASSE TERAPÊUTICA",
+    "SUBSTÂNCIA", "CNPJ", "LABORATÓRIO", "CÓDIGO GGREM", "REGISTRO",
+    "EAN 1", "EAN 2", "EAN 3", "PRODUTO", "APRESENTAÇÃO",
+    "F.FARMACÊUTICA", "CLASSE TERAPÊUTICA",
     "TIPO DE PRODUTO (STATUS DO PRODUTO)",
-    "REGIME DE PREÇO",
-    "TARJA",
-    "RESTRIÇÃO HOSPITALAR",
-    "CAP",
-    "CONFAZ 87",
-    "ICMS 0%",
-    "ANÁLISE RECURSAL",
+    "REGIME DE PREÇO", "TARJA", "RESTRIÇÃO HOSPITALAR",
+    "CAP", "CONFAZ 87", "ICMS 0%", "ANÁLISE RECURSAL",
 ]
 
-
+# Nomes alternativos conhecidos (ANVISA renomeia colunas ocasionalmente)
 NOMES_ALTERNATIVOS = {
-    "TIPO DE PRODUTO (REVOGADO/NOVO/IDÊNTICO)":
-        "TIPO DE PRODUTO (STATUS DO PRODUTO)",
-    "TIPO DE PRODUTO":
-        "TIPO DE PRODUTO (STATUS DO PRODUTO)",
-    "ANALISE RECURSAL":
-        "ANÁLISE RECURSAL",
-    "RESTRICAO HOSPITALAR":
-        "RESTRIÇÃO HOSPITALAR",
-    "RESTRIÇÃO HOSP.":
-        "RESTRIÇÃO HOSPITALAR",
-    "CLASSE TERAPEUTICA":
-        "CLASSE TERAPÊUTICA",
-    "FORMA FARMACEUTICA":
-        "F.FARMACÊUTICA",
-    "FORMA FARMACÊUTICA":
-        "F.FARMACÊUTICA",
-    "F. FARMACÊUTICA":
-        "F.FARMACÊUTICA",
-    "APRESENTACAO":
-        "APRESENTAÇÃO",
-    "CODIGO GGREM":
-        "CÓDIGO GGREM",
-    "SUBSTANCIA":
-        "SUBSTÂNCIA",
-    "LABORATORIO":
-        "LABORATÓRIO",
+    "TIPO DE PRODUTO (REVOGADO/NOVO/IDÊNTICO)": "TIPO DE PRODUTO (STATUS DO PRODUTO)",
+    "TIPO DE PRODUTO": "TIPO DE PRODUTO (STATUS DO PRODUTO)",
+    "ANALISE RECURSAL": "ANÁLISE RECURSAL",
+    "RESTRICAO HOSPITALAR": "RESTRIÇÃO HOSPITALAR",
+    "RESTRIÇÃO HOSP.": "RESTRIÇÃO HOSPITALAR",
+    "CLASSE TERAPEUTICA": "CLASSE TERAPÊUTICA",
+    "FORMA FARMACEUTICA": "F.FARMACÊUTICA",
+    "FORMA FARMACÊUTICA": "F.FARMACÊUTICA",
+    "F. FARMACÊUTICA": "F.FARMACÊUTICA",
+    "APRESENTACAO": "APRESENTAÇÃO",
+    "CODIGO GGREM": "CÓDIGO GGREM",
+    "SUBSTANCIA": "SUBSTÂNCIA",
+    "LABORATORIO": "LABORATÓRIO",
 }
 
-
+# Tabela de estados para dimensão
 ESTADOS_BRASIL = {
     "AC": ("Acre", "Norte"),
     "AL": ("Alagoas", "Nordeste"),
@@ -187,53 +148,59 @@ ESTADOS_BRASIL = {
 }
 
 
-# ============================================================================
-# CONFIGURAÇÃO E LOG
-# ============================================================================
+# ═══════════════════════════════════════════════════════════════════════
+# UTILITÁRIOS
+# ═══════════════════════════════════════════════════════════════════════
+
 
 def carregar_config(caminho_config: Optional[str] = None) -> dict:
+    """Carrega configurações de config.yaml ou usa padrão."""
     config = CONFIG_PADRAO.copy()
-
     if caminho_config and Path(caminho_config).exists():
         with open(caminho_config, "r", encoding="utf-8") as f:
-            custom = yaml.safe_load(f) or {}
+            custom = yaml.safe_load(f)
+            if custom:
+                config.update(custom)
+        logging.info(f"Configuração carregada de: {caminho_config}")
 
-        config.update(custom)
-
-        if "email_alerta" in custom:
-            config["email_alerta"] = {
-                **CONFIG_PADRAO["email_alerta"],
-                **custom["email_alerta"],
-            }
-
-        logging.info(
-            "Configuração carregada de: %s",
-            caminho_config,
-        )
+    # Segurança: credenciais NUNCA devem ficar no repositório.
+    # Elas são lidas de variáveis de ambiente (GitHub Secrets) quando existirem.
+    cfg_email = config.setdefault("email_alerta", {})
+    if os.getenv("SMTP_REMETENTE"):
+        cfg_email["remetente"] = os.environ["SMTP_REMETENTE"]
+    if os.getenv("SMTP_SENHA"):
+        cfg_email["senha"] = os.environ["SMTP_SENHA"]
+    if os.getenv("SMTP_DESTINATARIOS"):
+        cfg_email["destinatarios"] = [
+            e.strip() for e in os.environ["SMTP_DESTINATARIOS"].split(",") if e.strip()
+        ]
+    if os.getenv("EMAIL_ALERTA_ATIVO"):
+        cfg_email["ativo"] = os.environ["EMAIL_ALERTA_ATIVO"].lower() in ("1", "true", "sim")
 
     return config
 
 
 def configurar_log(config: dict) -> None:
+    """Configura logging com RotatingFileHandler + console."""
     dir_log = Path(config["diretorio_log"])
     dir_log.mkdir(parents=True, exist_ok=True)
 
-    caminho_log = dir_log / f"cmed_etl_{datetime.now():%Y%m}.log"
+    nome_log = f"cmed_etl_{datetime.now().strftime('%Y%m')}.log"
+    caminho_log = dir_log / nome_log
 
     formatter = logging.Formatter(
         "[%(asctime)s] %(levelname)-8s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    # Arquivo (rotação a cada 10 MB, mantém 5 backups)
     fh = RotatingFileHandler(
-        caminho_log,
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
+        caminho_log, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(formatter)
 
+    # Console
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(formatter)
@@ -245,499 +212,175 @@ def configurar_log(config: dict) -> None:
     root.addHandler(ch)
 
 
-def enviar_alerta_email(
-    config: dict,
-    assunto: str,
-    corpo: str,
-) -> None:
-    cfg = config.get("email_alerta", {})
-
-    if not cfg.get("ativo"):
+def enviar_alerta_email(config: dict, assunto: str, corpo: str) -> None:
+    """Envia e-mail de alerta em caso de falha."""
+    cfg_email = config.get("email_alerta", {})
+    if not cfg_email.get("ativo"):
         return
-
     try:
         msg = MIMEText(corpo, "plain", "utf-8")
         msg["Subject"] = f"[CMED ETL] {assunto}"
-        msg["From"] = cfg["remetente"]
-        msg["To"] = ", ".join(cfg["destinatarios"])
+        msg["From"] = cfg_email["remetente"]
+        msg["To"] = ", ".join(cfg_email["destinatarios"])
 
-        with smtplib.SMTP(
-            cfg["smtp_host"],
-            cfg["smtp_porta"],
-        ) as server:
+        with smtplib.SMTP(cfg_email["smtp_host"], cfg_email["smtp_porta"]) as server:
             server.starttls()
-            server.login(
-                cfg["remetente"],
-                cfg["senha"],
-            )
+            server.login(cfg_email["remetente"], cfg_email["senha"])
             server.send_message(msg)
-
         logging.info("Alerta enviado por e-mail.")
+    except Exception as e:
+        logging.error(f"Falha ao enviar e-mail de alerta: {e}")
 
-    except Exception as exc:
-        logging.error(
-            "Falha ao enviar e-mail de alerta: %s",
-            exc,
-        )
-
-
-# ============================================================================
-# HASH
-# ============================================================================
 
 def calcular_hash_arquivo(caminho: Path) -> str:
+    """Calcula SHA-256 do arquivo para verificação de integridade."""
     sha = hashlib.sha256()
-
     with open(caminho, "rb") as f:
-        for bloco in iter(
-            lambda: f.read(8192),
-            b"",
-        ):
+        for bloco in iter(lambda: f.read(8192), b""):
             sha.update(bloco)
-
     return sha.hexdigest()
 
 
-# ============================================================================
-# ESTADO
-# ============================================================================
+def criar_sessao_http(config: dict) -> requests.Session:
+    """
+    Cria uma sessão HTTP com retry automático a nível de conexão.
 
-def carregar_estado(caminho: str) -> dict:
-    path = Path(caminho)
-
-    if not path.exists():
-        logging.info(
-            "Estado CMED ainda não existe: %s",
-            path,
-        )
-        return {}
+    Isto é essencial no GitHub Actions: os runners rodam em datacenter
+    (Azure) e o gov.br frequentemente responde com 403/429/503 ou derruba
+    a conexão. O retry com backoff recupera falhas transitórias que não
+    acontecem na sua máquina local.
+    """
+    from requests.adapters import HTTPAdapter
 
     try:
-        with open(
-            path,
-            "r",
-            encoding="utf-8",
-        ) as f:
-            estado = json.load(f)
+        from urllib3.util.retry import Retry
+    except ImportError:  # urllib3 < 1.26
+        from requests.packages.urllib3.util.retry import Retry  # type: ignore
 
-        logging.info(
-            "Estado carregado: competência=%s",
-            estado.get("competencia"),
-        )
-
-        return estado
-
-    except (
-        OSError,
-        json.JSONDecodeError,
-    ) as exc:
-        logging.warning(
-            "Estado inválido ou ilegível: %s",
-            exc,
-        )
-        return {}
-
-
-def salvar_estado(
-    caminho: str,
-    estado: dict,
-) -> None:
-    path = Path(caminho)
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
+    sessao = requests.Session()
+    retry = Retry(
+        total=config.get("tentativas_max", 3),
+        connect=config.get("tentativas_max", 3),
+        read=config.get("tentativas_max", 3),
+        backoff_factor=2,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        raise_on_status=False,
     )
+    adapter = HTTPAdapter(max_retries=retry)
+    sessao.mount("https://", adapter)
+    sessao.mount("http://", adapter)
 
-    temporario = path.with_suffix(
-        path.suffix + ".tmp"
-    )
+    # Cabeçalhos "de navegador" reduzem bloqueios do WAF do gov.br.
+    sessao.headers.update({
+        "User-Agent": config["user_agent"],
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,"
+            "application/vnd.ms-excel,*/*;q=0.8"
+        ),
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    })
+    return sessao
 
-    with open(
-        temporario,
-        "w",
+
+def carregar_estado(config: dict) -> dict:
+    """Lê o arquivo de estado (última competência processada)."""
+    caminho = Path(config.get("arquivo_estado", ".github/cmed/estado.json"))
+    if caminho.exists():
+        try:
+            return json.loads(caminho.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            logging.warning(f"Estado ilegível ({e}). Iniciando estado vazio.")
+    return {}
+
+
+def salvar_estado(config: dict, estado: dict) -> None:
+    """
+    Grava o arquivo de estado. Isto também garante que o caminho exista
+    para o `git add .github/cmed/estado.json` do workflow não falhar.
+    """
+    caminho = Path(config.get("arquivo_estado", ".github/cmed/estado.json"))
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    caminho.write_text(
+        json.dumps(estado, ensure_ascii=False, indent=2),
         encoding="utf-8",
-    ) as f:
-        json.dump(
-            estado,
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-        f.write("\n")
-
-    temporario.replace(path)
-
-    logging.info(
-        "Estado atualizado: %s",
-        path,
     )
+    logging.info(f"Estado salvo: {caminho}")
 
 
-def estado_ja_processado(
-    estado: dict,
-    competencia: str,
-    hashes: dict,
-) -> bool:
+# ═══════════════════════════════════════════════════════════════════════
+# 1. EXTRAÇÃO — Download dos arquivos CMED
+# ═══════════════════════════════════════════════════════════════════════
 
-    if not estado:
-        return False
-
-    mesma_competencia = (
-        estado.get("competencia") == competencia
-    )
-
-    hashes_atuais = {
-        "PMC": hashes.get("PMC"),
-        "PMVG": hashes.get("PMVG"),
-    }
-
-    hashes_salvos = {
-        "PMC": estado.get("hashes", {}).get("PMC"),
-        "PMVG": estado.get("hashes", {}).get("PMVG"),
-    }
-
-    if (
-        mesma_competencia
-        and hashes_atuais == hashes_salvos
-    ):
-        logging.info(
-            "Competência %s já processada com os mesmos "
-            "arquivos. Nenhum processamento necessário.",
-            competencia,
-        )
-        return True
-
-    if mesma_competencia:
-        logging.info(
-            "Competência %s já existe, mas o hash dos "
-            "arquivos mudou. Novo processamento será realizado.",
-            competencia,
-        )
-
-    return False
-
-
-# ============================================================================
-# EXTRAÇÃO — DESCOBERTA DOS LINKS CMED
-# ============================================================================
 
 def obter_links_cmed(config: dict) -> dict:
     """
-    Descobre automaticamente os links atuais da CMED.
-
-    A página oficial atualmente apresenta os arquivos como:
-
-        PMC - xls
-        PMVG - xls
-
-    O retorno mantém as chaves:
-
-        {
-            "PMC": "...",
-            "PMVG": "..."
-        }
-
-    Compatibilidade:
-    - links absolutos;
-    - links relativos;
-    - texto do link;
-    - URL do link;
-    - pequenas alterações de nomenclatura;
-    - páginas antigas da CMED;
-    - parâmetros na URL;
-    - links sem extensão explícita no href.
+    Acessa a página da CMED/ANVISA e extrai os links dos arquivos
+    PMC (.xlsx site) e PF/PMVG (.xlsx gov) mais recentes.
     """
-
     url = config["url_cmed"]
+    timeout = config["timeout_segundos"]
+    sessao = config.get("_sessao") or criar_sessao_http(config)
 
-    headers = {
-        "User-Agent": config["user_agent"],
-        "Accept": (
-            "text/html,application/xhtml+xml,"
-            "application/xml;q=0.9,"
-            "image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-
-    logging.info(
-        "Acessando página oficial de arquivos CMED: %s",
-        url,
-    )
-
-    resp = requests.get(
-        url,
-        headers=headers,
-        timeout=config["timeout_segundos"],
-        verify=True,
-    )
-
+    logging.info(f"Acessando página CMED: {url}")
+    resp = sessao.get(url, timeout=timeout, verify=True)
+    if resp.status_code != 200:
+        # Diagnóstico: no CI, gov.br costuma devolver 403 (bloqueio de WAF/IP
+        # de datacenter). O trecho abaixo ajuda a distinguir bloqueio de bug.
+        amostra = resp.text[:500].replace("\n", " ")
+        logging.error(
+            f"Página CMED respondeu HTTP {resp.status_code}. "
+            f"Início da resposta: {amostra!r}"
+        )
     resp.raise_for_status()
 
-    logging.info(
-        "Página CMED acessada com sucesso — "
-        "HTTP %s (%s bytes).",
-        resp.status_code,
-        f"{len(resp.content):,}",
-    )
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    soup = BeautifulSoup(
-        resp.text,
-        "html.parser",
-    )
+    links_encontrados = {"PMC": None, "PF": None}
 
-    candidatos = []
-
+    # Procurar todos os links na página
     for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        texto = a.get_text(strip=True).lower()
 
-        href_original = str(
-            a.get("href", "")
-        ).strip()
-
-        texto = a.get_text(
-            " ",
-            strip=True,
-        )
-
-        title = str(
-            a.get("title", "")
-        ).strip()
-
-        aria_label = str(
-            a.get("aria-label", "")
-        ).strip()
-
-        if not href_original:
-            continue
-
-        href = urljoin(
-            url,
-            href_original,
-        )
-
-        texto_completo = " ".join(
-            [
-                texto,
-                title,
-                aria_label,
-                href,
-            ]
-        )
-
-        texto_lower = texto_completo.lower()
-
-        # Só consideramos candidatos relacionados
-        # a arquivos/planilhas CMED.
-        palavras_excel = (
-            ".xls",
-            ".xlsx",
-            "xls",
-            "planilha",
-            "arquivo",
-        )
-
-        palavras_cmed = (
-            "pmc",
-            "pmvg",
-            "preço",
-            "precos",
-            "preços",
-            "medicamento",
-        )
-
-        parece_excel = any(
-            palavra in texto_lower
-            for palavra in palavras_excel
-        )
-
-        parece_cmed = any(
-            palavra in texto_lower
-            for palavra in palavras_cmed
-        )
-
-        if not (parece_excel and parece_cmed):
-            continue
-
-        candidatos.append(
-            {
-                "texto": texto,
-                "title": title,
-                "aria_label": aria_label,
-                "href": href,
-                "texto_lower": texto_lower,
-            }
-        )
-
-    logging.info(
-        "Candidatos de arquivos CMED encontrados: %s",
-        len(candidatos),
-    )
-
-    for candidato in candidatos:
-        logging.debug(
-            "Candidato CMED: texto='%s' | title='%s' | url='%s'",
-            candidato["texto"],
-            candidato["title"],
-            candidato["href"],
-        )
-
-    links = {
-        "PMC": None,
-        "PMVG": None,
-    }
-
-    # ------------------------------------------------------------------
-    # PMC — prioridade por texto
-    # ------------------------------------------------------------------
-
-    regras_pmc = [
-        lambda x: (
-            "pmc" in x["texto_lower"]
-            and "xls" in x["texto_lower"]
-        ),
-        lambda x: (
-            "pmc" in x["texto_lower"]
-            and "planilha" in x["texto_lower"]
-        ),
-        lambda x: (
-            "pmc" in x["href"].lower()
-        ),
-    ]
-
-    for regra in regras_pmc:
-        for candidato in candidatos:
-            if regra(candidato):
-                links["PMC"] = candidato["href"]
-
-                logging.info(
-                    "Link PMC encontrado: %s",
-                    links["PMC"],
+        # PMC — arquivo "site" (xls_conformidade_site_*)
+        if "xls_conformidade_site" in href or ("pmc" in texto and ".xls" in href):
+            if href.endswith((".xlsx", ".xls")):
+                links_encontrados["PMC"] = href if href.startswith("http") else (
+                    f"https://www.gov.br{href}"
                 )
-                break
 
-        if links["PMC"]:
-            break
-
-    # ------------------------------------------------------------------
-    # PMVG — prioridade por texto
-    # ------------------------------------------------------------------
-
-    regras_pmvg = [
-        lambda x: (
-            "pmvg" in x["texto_lower"]
-            and "xls" in x["texto_lower"]
-        ),
-        lambda x: (
-            "pmvg" in x["texto_lower"]
-            and "planilha" in x["texto_lower"]
-        ),
-        lambda x: (
-            "pmvg" in x["href"].lower()
-        ),
-    ]
-
-    for regra in regras_pmvg:
-        for candidato in candidatos:
-            if regra(candidato):
-                links["PMVG"] = candidato["href"]
-
-                logging.info(
-                    "Link PMVG encontrado: %s",
-                    links["PMVG"],
+        # PF/PMVG — arquivo "gov" (xls_conformidade_gov_*)
+        if "xls_conformidade_gov" in href or ("pmvg" in texto and ".xls" in href):
+            if href.endswith((".xlsx", ".xls")):
+                links_encontrados["PF"] = href if href.startswith("http") else (
+                    f"https://www.gov.br{href}"
                 )
-                break
 
-        if links["PMVG"]:
-            break
-
-    # ------------------------------------------------------------------
-    # Compatibilidade com estrutura antiga
-    # ------------------------------------------------------------------
-
-    if not links["PMC"]:
-        for candidato in candidatos:
-            href = candidato["href"].lower()
-
-            if (
-                "xls_conformidade_site" in href
-                or "conformidade" in href
-            ):
-                links["PMC"] = candidato["href"]
-
-                logging.info(
-                    "Link PMC encontrado pelo padrão "
-                    "de compatibilidade antiga: %s",
-                    links["PMC"],
+    # Fallback: procurar links que contenham padrão de data no nome
+    if not links_encontrados["PMC"] or not links_encontrados["PF"]:
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if re.search(r"xls_conformidade_site_\d{8}", href):
+                links_encontrados["PMC"] = href if href.startswith("http") else (
+                    f"https://www.gov.br{href}"
                 )
-                break
-
-    if not links["PMVG"]:
-        for candidato in candidatos:
-            href = candidato["href"].lower()
-
-            if (
-                "xls_conformidade_gov" in href
-                or "conformidade_gov" in href
-            ):
-                links["PMVG"] = candidato["href"]
-
-                logging.info(
-                    "Link PMVG encontrado pelo padrão "
-                    "de compatibilidade antiga: %s",
-                    links["PMVG"],
+            if re.search(r"xls_conformidade_gov_\d{8}", href):
+                links_encontrados["PF"] = href if href.startswith("http") else (
+                    f"https://www.gov.br{href}"
                 )
-                break
 
-    # ------------------------------------------------------------------
-    # Validação final
-    # ------------------------------------------------------------------
+    for tipo, link in links_encontrados.items():
+        if link:
+            logging.info(f"Link {tipo} encontrado: {link}")
+        else:
+            logging.warning(f"Link {tipo} NÃO encontrado na página.")
 
-    if not links["PMC"]:
-        logging.error(
-            "Não foi possível localizar o arquivo PMC "
-            "na página oficial da CMED."
-        )
-
-    if not links["PMVG"]:
-        logging.error(
-            "Não foi possível localizar o arquivo PMVG "
-            "na página oficial da CMED."
-        )
-
-    if not links["PMC"] or not links["PMVG"]:
-        logging.error(
-            "Links encontrados: %s",
-            links,
-        )
-
-        raise RuntimeError(
-            "A página CMED foi acessada, mas não foi possível "
-            "identificar simultaneamente os arquivos PMC e PMVG."
-        )
-
-    logging.info(
-        "Arquivos CMED identificados com sucesso."
-    )
-
-    return links
-
-
-# ============================================================================
-# DOWNLOAD
-# ============================================================================
-
-def obter_extensao_url(url: str) -> str:
-    caminho = urlparse(url).path.lower()
-
-    if caminho.endswith(".xlsx"):
-        return ".xlsx"
-
-    if caminho.endswith(".xls"):
-        return ".xls"
-
-    return ".xlsx"
+    return links_encontrados
 
 
 def baixar_arquivo_cmed(
@@ -746,850 +389,403 @@ def baixar_arquivo_cmed(
     config: dict,
     competencia: Optional[str] = None,
 ) -> Path:
-
+    """
+    Faz download de um arquivo CMED com retry automático.
+    Retorna o Path do arquivo salvo.
+    """
     tentativas = config["tentativas_max"]
     intervalo = config["intervalo_retry_segundos"]
+    timeout = config["timeout_segundos"]
+    sessao = config.get("_sessao") or criar_sessao_http(config)
+    headers = {"Referer": config["url_cmed"]}
 
-    headers = {
-        "User-Agent": config["user_agent"],
-        "Accept": (
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet,"
-            "application/vnd.ms-excel,"
-            "*/*"
-        ),
-    }
+    # Extrair competência do nome do arquivo (YYYYMMDD)
+    match_data = re.search(r"(\d{8})", url)
+    if match_data and not competencia:
+        data_str = match_data.group(1)
+        competencia = f"{data_str[:4]}-{data_str[4:6]}"
 
     if not competencia:
-        match = re.search(
-            r"(20\d{2})[-_]?([01]\d)",
-            url,
-        )
+        competencia = datetime.now().strftime("%Y-%m")
 
-        if match:
-            competencia = (
-                f"{match.group(1)}-{match.group(2)}"
-            )
+    # Diretório de destino
+    dir_raw = Path(config["diretorio_raw"]) / competencia
+    dir_raw.mkdir(parents=True, exist_ok=True)
 
-    competencia = (
-        competencia
-        or datetime.now().strftime("%Y-%m")
-    )
+    # Nome do arquivo local
+    nome_arquivo = url.split("/")[-1]
+    if not nome_arquivo.endswith((".xlsx", ".xls")):
+        nome_arquivo = f"cmed_{tipo.lower()}_{competencia}.xlsx"
+    caminho_local = dir_raw / nome_arquivo
 
-    dir_raw = (
-        Path(config["diretorio_raw"])
-        / competencia
-    )
-
-    dir_raw.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    nome_url = Path(
-        urlparse(url).path
-    ).name
-
-    extensao = obter_extensao_url(url)
-
-    if nome_url and "." in nome_url:
-        nome_arquivo = nome_url
-    else:
-        nome_arquivo = (
-            f"cmed_{tipo.lower()}_"
-            f"{competencia}{extensao}"
-        )
-
-    caminho_local = (
-        dir_raw / nome_arquivo
-    )
-
-    for tentativa in range(
-        1,
-        tentativas + 1,
-    ):
-
+    for tentativa in range(1, tentativas + 1):
         try:
             logging.info(
-                "Download %s — tentativa %s/%s: %s",
-                tipo,
-                tentativa,
-                tentativas,
-                url,
+                f"Download {tipo} — tentativa {tentativa}/{tentativas}: {url}"
             )
-
-            resp = requests.get(
-                url,
-                headers=headers,
-                timeout=config["timeout_segundos"],
-                stream=True,
-                allow_redirects=True,
-            )
-
+            resp = sessao.get(url, headers=headers, timeout=timeout, stream=True)
             resp.raise_for_status()
 
-            with open(
-                caminho_local,
-                "wb",
-            ) as f:
-
-                for chunk in resp.iter_content(
-                    chunk_size=1024 * 1024
-                ):
-                    if chunk:
-                        f.write(chunk)
+            with open(caminho_local, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
 
             tamanho = caminho_local.stat().st_size
-
             if tamanho < 1024:
                 raise ValueError(
-                    f"Arquivo muito pequeno "
-                    f"({tamanho} bytes)."
+                    f"Arquivo muito pequeno ({tamanho} bytes) — possível erro de download."
                 )
 
-            sha = calcular_hash_arquivo(
-                caminho_local
-            )
-
+            sha = calcular_hash_arquivo(caminho_local)
             logging.info(
-                "Download %s concluído: %s "
-                "(%s bytes, SHA-256: %s...)",
-                tipo,
-                caminho_local,
-                f"{tamanho:,}",
-                sha[:16],
+                f"Download {tipo} concluído: {caminho_local} "
+                f"({tamanho:,} bytes, SHA-256: {sha[:16]}...)"
             )
-
             return caminho_local
 
-        except (
-            requests.RequestException,
-            ValueError,
-            OSError,
-        ) as exc:
-
-            logging.error(
-                "Erro no download %s "
-                "(tentativa %s): %s",
-                tipo,
-                tentativa,
-                exc,
-            )
-
+        except (requests.RequestException, ValueError) as e:
+            logging.error(f"Erro no download {tipo} (tentativa {tentativa}): {e}")
             if tentativa < tentativas:
+                logging.info(f"Aguardando {intervalo}s antes de nova tentativa...")
                 time.sleep(intervalo)
-
             else:
-                msg = (
-                    f"Falha permanente no download "
-                    f"{tipo} após {tentativas} tentativas: "
-                    f"{exc}"
-                )
-
+                msg = f"Falha permanente no download {tipo} após {tentativas} tentativas: {e}"
                 logging.critical(msg)
+                enviar_alerta_email(config, f"Falha download {tipo}", msg)
+                raise RuntimeError(msg) from e
 
-                enviar_alerta_email(
-                    config,
-                    f"Falha download {tipo}",
-                    msg,
-                )
-
-                raise RuntimeError(
-                    msg
-                ) from exc
-
-    raise RuntimeError(
-        "Fluxo inesperado no download."
-    )
+    raise RuntimeError("Fluxo inesperado na função de download.")
 
 
-# ============================================================================
-# TRANSFORMAÇÃO
-# ============================================================================
+# ═══════════════════════════════════════════════════════════════════════
+# 2. TRANSFORMAÇÃO — Tratamento de qualidade
+# ═══════════════════════════════════════════════════════════════════════
+
 
 def validar_ean13(ean: str) -> bool:
-
+    """
+    Valida dígito verificador EAN-13.
+    Retorna True se o EAN-13 é válido, False caso contrário.
+    """
     if not ean or not isinstance(ean, str):
         return False
-
-    ean = re.sub(
-        r"\D",
-        "",
-        ean,
-    )
-
+    ean = re.sub(r"\D", "", str(ean))
     if len(ean) != 13:
         return False
-
     try:
-        soma = sum(
-            int(digito)
-            * (1 if i % 2 == 0 else 3)
-            for i, digito in enumerate(ean[:12])
-        )
-
-        verificador = (
-            10 - (soma % 10)
-        ) % 10
-
-        return (
-            verificador
-            == int(ean[12])
-        )
-
-    except (
-        ValueError,
-        IndexError,
-    ):
+        soma = 0
+        for i, digito in enumerate(ean[:12]):
+            peso = 1 if i % 2 == 0 else 3
+            soma += int(digito) * peso
+        verificador = (10 - (soma % 10)) % 10
+        return verificador == int(ean[12])
+    except (ValueError, IndexError):
         return False
 
 
 def tratar_ean(valor) -> Optional[str]:
-
-    if valor is None:
+    """
+    Trata valor de EAN: remove não-numéricos, preenche zeros à esquerda.
+    Retorna string de 13 dígitos ou None.
+    """
+    if valor is None or (isinstance(valor, float) and np.isnan(valor)):
         return None
-
-    if isinstance(valor, float) and np.isnan(valor):
-        return None
-
     texto = str(valor).strip()
-
-    if texto.lower() in (
-        "nan",
-        "none",
-        "",
-    ):
+    if not texto or texto.lower() in ("nan", "none", ""):
         return None
-
-    numeros = re.sub(
-        r"\D",
-        "",
-        texto,
-    )
-
+    # Remover caracteres não numéricos
+    numeros = re.sub(r"\D", "", texto)
     if not numeros or numeros == "0":
         return None
-
+    # Preencher com zeros à esquerda até 13 dígitos
     return numeros.zfill(13)
 
 
 def tratar_valor_preco(valor) -> tuple:
-
-    if valor is None:
-        return None, False
-
-    if (
-        isinstance(valor, float)
-        and np.isnan(valor)
-    ):
-        return None, False
+    """
+    Trata valores de preço da CMED.
+    Retorna (valor_float_ou_None, flag_asterisco_bool).
+    """
+    if valor is None or (isinstance(valor, float) and np.isnan(valor)):
+        return (None, False)
 
     texto = str(valor).strip()
+    if not texto or texto.lower() in ("nan", "none", "-", ""):
+        return (None, False)
 
-    if texto.lower() in (
-        "nan",
-        "none",
-        "-",
-        "",
-    ):
-        return None, False
-
+    # Detectar asterisco
     flag_asterisco = "*" in texto
-
-    texto = texto.replace(
-        "*",
-        "",
-    ).strip()
+    texto = texto.replace("*", "").strip()
 
     if not texto:
-        return None, flag_asterisco
+        return (None, flag_asterisco)
 
+    # Tratar separadores decimais
+    # Se tem vírgula E ponto: ponto é milhar, vírgula é decimal (padrão BR)
     if "," in texto and "." in texto:
-        texto = (
-            texto
-            .replace(".", "")
-            .replace(",", ".")
-        )
-
+        texto = texto.replace(".", "").replace(",", ".")
     elif "," in texto:
-        texto = texto.replace(
-            ",",
-            ".",
-        )
+        texto = texto.replace(",", ".")
 
     try:
-        return (
-            float(texto),
-            flag_asterisco,
-        )
-
+        valor_float = float(texto)
+        return (valor_float, flag_asterisco)
     except ValueError:
-        logging.warning(
-            "Valor de preço não numérico ignorado: '%s'",
-            valor,
-        )
-
-        return (
-            None,
-            flag_asterisco,
-        )
+        logging.warning(f"Valor de preço não numérico ignorado: '{valor}'")
+        return (None, flag_asterisco)
 
 
-def _normalizar_texto_cabecalho(
-    valor,
-) -> str:
-
-    if valor is None:
+def _normalizar_texto_cabecalho(valor) -> str:
+    """Normaliza texto de cabeçalho sem depender de posição fixa na planilha."""
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
         return ""
-
-    if (
-        isinstance(valor, float)
-        and pd.isna(valor)
-    ):
-        return ""
-
-    texto = str(valor)
-    texto = texto.replace(
-        "\xa0",
-        " ",
-    ).strip()
-
-    texto = re.sub(
-        r"\s+",
-        " ",
-        texto,
-    )
-
-    texto = re.sub(
-        r"\s+%",
-        "%",
-        texto,
-    )
-
+    texto = str(valor).replace("\xa0", " ").strip()
+    texto = re.sub(r"\s+", " ", texto)
+    # A CMED alterna entre "PF 12%" e "PF 12 %".
+    texto = re.sub(r"\s+%", "%", texto)
     return texto.upper()
 
 
-def detectar_linha_cabecalho(
-    df: pd.DataFrame,
-) -> int:
+def detectar_linha_cabecalho(df: pd.DataFrame) -> int:
+    """
+    Detecta dinamicamente o cabeçalho real da CMED.
 
+    Não usa linha fixa. A detecção exige um conjunto de nomes de coluna
+    realmente presentes na tabela, evitando confundir as notas explicativas
+    que aparecem antes do cabeçalho e que também contêm palavras como
+    "produto".
+    """
     identificadores = {
-        _normalizar_texto_cabecalho(x)
-        for x in COLUNAS_IDENTIFICACAO
+        "SUBSTÂNCIA", "CNPJ", "LABORATÓRIO", "CÓDIGO GGREM", "REGISTRO",
+        "EAN 1", "EAN 2", "EAN 3", "PRODUTO", "APRESENTAÇÃO",
+        "CLASSE TERAPÊUTICA", "TIPO DE PRODUTO (STATUS DO PRODUTO)",
+        "REGIME DE PREÇO", "RESTRIÇÃO HOSPITALAR", "CAP", "CONFAZ 87",
+        "ICMS 0%", "ANÁLISE RECURSAL", "TARJA"
     }
 
     def eh_coluna_preco(nome: str) -> bool:
         n = _normalizar_texto_cabecalho(nome)
-
-        return bool(
-            re.match(
-                r"^(PF|PMC|PMVG)\s+"
-                r"(SEM IMPOSTOS|\d+(?:,\d+)?%)$",
-                n,
-            )
-        )
+        # Aceita PF/PMC/PMVG e qualquer alíquota que a CMED publicar,
+        # mas ignora as colunas "ALC", que são valores derivados.
+        return bool(re.match(r"^(PF|PMC|PMVG)\s+(SEM IMPOSTOS|\d+(?:,\d+)?%)$", n))
 
     melhor_idx = None
     melhor_score = -1
 
-    limite = min(
-        len(df),
-        250,
-    )
-
+    # As notas ficam no topo; 150 linhas é suficiente para detectar o header
+    # sem impor uma posição fixa. Se a CMED futuramente aumentar as notas,
+    # ainda assim podemos localizar o cabeçalho em uma janela ampla.
+    limite = min(len(df), 200)
     for idx in range(limite):
+        valores = [_normalizar_texto_cabecalho(v) for v in df.iloc[idx].tolist()]
+        valores = {v for v in valores if v}
 
-        valores = {
-            _normalizar_texto_cabecalho(v)
-            for v in df.iloc[idx].tolist()
-        }
+        acertos_id = len(valores & identificadores)
+        acertos_preco = sum(eh_coluna_preco(v) for v in valores)
 
-        valores.discard("")
-
-        acertos_id = len(
-            valores & identificadores
-        )
-
-        acertos_preco = sum(
-            eh_coluna_preco(v)
-            for v in valores
-        )
-
-        score = (
-            acertos_id * 10
-            + acertos_preco * 3
-        )
-
-        if (
-            acertos_id >= 8
-            and acertos_preco >= 3
-            and score > melhor_score
-        ):
+        # O cabeçalho real tem vários identificadores + várias colunas de preço.
+        score = acertos_id * 10 + acertos_preco * 3
+        if acertos_id >= 8 and acertos_preco >= 3 and score > melhor_score:
             melhor_idx = idx
             melhor_score = score
 
     if melhor_idx is None:
         raise ValueError(
-            "Não foi possível identificar "
-            "automaticamente o cabeçalho da CMED."
+            "Não foi possível identificar automaticamente o cabeçalho da CMED. "
+            "O arquivo não será processado para evitar gerar dados incorretos."
         )
 
     logging.info(
-        "Cabeçalho CMED detectado na linha Excel %s "
-        "(índice pandas %s; score=%s).",
-        melhor_idx + 1,
-        melhor_idx,
-        melhor_score,
+        f"Cabeçalho CMED detectado automaticamente na linha Excel {melhor_idx + 1}. "
+        f"(índice pandas {melhor_idx}; score={melhor_score})."
     )
-
     return melhor_idx
 
 
-def normalizar_nomes_colunas(
-    colunas: list,
-) -> list:
-
+def normalizar_nomes_colunas(colunas: list) -> list:
+    """Normaliza nomes, inclusive espaços variáveis antes do símbolo %."""
     resultado = []
-
-    alternativas = {
-        re.sub(
-            r"\s+",
-            " ",
-            str(k)
-            .replace("\xa0", " ")
-            .strip(),
-        ).upper(): v
-        for k, v in NOMES_ALTERNATIVOS.items()
-    }
-
     for col in colunas:
-
-        col_limpo = (
-            str(col)
-            .replace("\xa0", " ")
-            .strip()
-        )
-
-        col_limpo = re.sub(
-            r"\s+",
-            " ",
-            col_limpo,
-        )
-
-        col_limpo = re.sub(
-            r"\s+%",
-            "%",
-            col_limpo,
-        )
+        col_limpo = str(col).replace("\xa0", " ").strip()
+        col_limpo = re.sub(r"\s+", " ", col_limpo)
+        col_limpo = re.sub(r"\s+%", "%", col_limpo)
 
         col_upper = col_limpo.upper()
-
-        if col_upper in alternativas:
-            col_limpo = alternativas[
-                col_upper
-            ]
-
-        resultado.append(
-            col_limpo
-        )
-
+        for alt, padrao in NOMES_ALTERNATIVOS.items():
+            alt_norm = re.sub(r"\s+", " ", str(alt).replace("\xa0", " ").strip()).upper()
+            if col_upper == alt_norm:
+                col_limpo = padrao
+                break
+        resultado.append(col_limpo)
     return resultado
 
 
-# ============================================================================
-# LEITURA
-# ============================================================================
+def _selecionar_engine(caminho: Path) -> str:
+    """Escolhe o engine do pandas conforme a extensão do arquivo."""
+    sufixo = caminho.suffix.lower()
+    if sufixo == ".xls":
+        return "xlrd"       # formato antigo (BIFF)
+    return "openpyxl"       # .xlsx / .xlsm
 
-def ler_arquivo_cmed(
-    caminho: Path,
-) -> pd.DataFrame:
 
-    logging.info(
-        "Lendo arquivo: %s",
-        caminho,
-    )
+def ler_arquivo_cmed(caminho: Path) -> pd.DataFrame:
+    """Lê arquivo CMED, encontra o cabeçalho dinamicamente e valida a estrutura."""
+    logging.info(f"Lendo arquivo: {caminho}")
 
-    suffix = caminho.suffix.lower()
+    engine = _selecionar_engine(caminho)
+    df_raw = pd.read_excel(caminho, header=None, dtype=str, engine=engine)
+    idx_header = detectar_linha_cabecalho(df_raw)
 
-    # Arquivos XLSX
-    if suffix == ".xlsx":
+    df = pd.read_excel(caminho, header=idx_header, dtype=str, engine=engine)
+    df.columns = normalizar_nomes_colunas(list(df.columns))
+    df.dropna(how="all", inplace=True)
 
-        df_raw = pd.read_excel(
-            caminho,
-            header=None,
-            dtype=str,
-            engine="openpyxl",
-        )
-
-    # Arquivos XLS antigos.
-    # Caso realmente apareça XLS binário, o ambiente
-    # precisa ter xlrd instalado.
-    elif suffix == ".xls":
-
-        try:
-            df_raw = pd.read_excel(
-                caminho,
-                header=None,
-                dtype=str,
-                engine="xlrd",
-            )
-
-        except ImportError as exc:
-            raise RuntimeError(
-                "O arquivo CMED foi publicado em formato .xls "
-                "e o pacote 'xlrd' não está instalado. "
-                "Adicione 'xlrd' ao requirements.txt."
-            ) from exc
-
-    else:
-        raise ValueError(
-            f"Formato de arquivo não suportado: {suffix}"
-        )
-
-    idx_header = detectar_linha_cabecalho(
-        df_raw
-    )
-
-    if suffix == ".xlsx":
-
-        df = pd.read_excel(
-            caminho,
-            header=idx_header,
-            dtype=str,
-            engine="openpyxl",
-        )
-
-    else:
-
-        df = pd.read_excel(
-            caminho,
-            header=idx_header,
-            dtype=str,
-            engine="xlrd",
-        )
-
-    df.columns = normalizar_nomes_colunas(
-        list(df.columns)
-    )
-
-    df.dropna(
-        how="all",
-        inplace=True,
-    )
-
-    obrigatorias = {
-        "SUBSTÂNCIA",
-        "CNPJ",
-        "LABORATÓRIO",
-        "CÓDIGO GGREM",
-        "EAN 1",
-        "PRODUTO",
-        "APRESENTAÇÃO",
-    }
-
-    ausentes = sorted(
-        obrigatorias - set(df.columns)
-    )
-
+    obrigatorias = {"SUBSTÂNCIA", "CNPJ", "LABORATÓRIO", "CÓDIGO GGREM", "EAN 1", "PRODUTO", "APRESENTAÇÃO"}
+    ausentes = sorted(obrigatorias - set(df.columns))
     if ausentes:
-        raise ValueError(
-            f"Colunas obrigatórias ausentes: {ausentes}"
-        )
+        raise ValueError(f"Cabeçalho detectado, mas colunas obrigatórias ausentes: {ausentes}")
 
-    logging.info(
-        "Arquivo lido: %s linhas × %s colunas.",
-        len(df),
-        len(df.columns),
-    )
-
+    logging.info(f"Arquivo lido: {len(df)} linhas × {len(df.columns)} colunas.")
     return df
 
-
-# ============================================================================
-# COMPETÊNCIA
-# ============================================================================
-
-def extrair_competencia_do_arquivo(
-    caminho: Path,
-) -> str:
-
+def extrair_competencia_do_arquivo(caminho: Path) -> str:
+    """Extrai YYYY-MM do nome do arquivo; só usa YYYYMMDD como fallback."""
     nome = caminho.name
+    match = re.search(r"(20\d{2})-(0[1-9]|1[0-2])", nome)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
 
-    padroes = [
-        r"(20\d{2})[-_](0[1-9]|1[0-2])",
-        r"(20\d{2})(0[1-9]|1[0-2])\d{2}",
-        r"(0[1-9]|1[0-2])[-_](20\d{2})",
-    ]
-
-    for i, padrao in enumerate(padroes):
-
-        match = re.search(
-            padrao,
-            nome,
-        )
-
-        if not match:
-            continue
-
-        if i == 2:
-            return (
-                f"{match.group(2)}-"
-                f"{match.group(1)}"
-            )
-
-        return (
-            f"{match.group(1)}-"
-            f"{match.group(2)}"
-        )
+    match = re.search(r"(20\d{2})(0[1-9]|1[0-2])\d{2}", nome)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
 
     logging.warning(
-        "Não foi possível extrair competência "
-        "do nome '%s'. Usando mês atual.",
-        nome,
+        f"Não foi possível extrair competência de '{nome}'. Usando mês atual."
     )
-
-    return datetime.now().strftime(
-        "%Y-%m"
-    )
+    return datetime.now().strftime("%Y-%m")
 
 
-# ============================================================================
-# COLUNAS DE PREÇO
-# ============================================================================
-
-def detectar_colunas_preco(
-    df: pd.DataFrame,
-    tipo_preco: str,
-) -> list:
-
+def detectar_colunas_preco(df: pd.DataFrame, tipo_preco: str) -> list:
+    """Encontra dinamicamente todas as colunas de preço publicadas pela CMED."""
+    prefixos = {"PMC": ("PMC",), "PF": ("PF",)}[tipo_preco]
     encontradas = []
-
-    tipo_preco = tipo_preco.upper()
-
     for col in df.columns:
-
-        n = _normalizar_texto_cabecalho(
-            col
-        )
-
-        if not n.startswith(
-            tipo_preco
-        ):
+        n = _normalizar_texto_cabecalho(col)
+        if not n.startswith(prefixos):
             continue
-
+        # Não usar colunas ALC: são preços alternativos e não a alíquota-base.
         if " ALC" in n:
             continue
-
-        if re.match(
-            r"^(PF|PMC|PMVG)\s+"
-            r"(SEM IMPOSTOS|\d+(?:,\d+)?%)$",
-            n,
-        ):
+        if re.match(r"^(PF|PMC)\s+(SEM IMPOSTOS|\d+(?:,\d+)?%)$", n):
             encontradas.append(col)
-
     return encontradas
-
-
-# ============================================================================
-# PROCESSAMENTO
-# ============================================================================
 
 def processar_tabela_precos(
     df: pd.DataFrame,
     caminho: Path,
     tipo_preco: str,
-    competencia: Optional[str] = None,
 ) -> pd.DataFrame:
-
-    competencia = (
-        competencia
-        or extrair_competencia_do_arquivo(
-            caminho
-        )
-    )
-
+    """
+    Processa tabela de preços (PMC ou PF): trata EANs, valores, faz unpivot.
+    tipo_preco: 'PMC' ou 'PF'
+    """
+    competencia = extrair_competencia_do_arquivo(caminho)
     data_carga = datetime.now()
+    logging.info(f"Processando {tipo_preco} — competência: {competencia}")
 
-    logging.info(
-        "Processando %s — competência: %s",
-        tipo_preco,
-        competencia,
-    )
-
-    for col_ean in (
-        "EAN 1",
-        "EAN 2",
-        "EAN 3",
-    ):
+    # ── Tratar EANs ────────────────────────────────────────────────
+    for col_ean in ["EAN 1", "EAN 2", "EAN 3"]:
         if col_ean in df.columns:
-            df[col_ean] = df[
-                col_ean
-            ].apply(tratar_ean)
+            df[col_ean] = df[col_ean].apply(tratar_ean)
 
-    colunas_preco = detectar_colunas_preco(
-        df,
-        tipo_preco,
-    )
+    # ── Identificar colunas de preço disponíveis ───────────────────
+    prefixo = tipo_preco
+    colunas_preco_presentes = detectar_colunas_preco(df, tipo_preco)
 
-    if not colunas_preco:
+    if not colunas_preco_presentes:
         logging.error(
-            "Nenhuma coluna de preço %s encontrada.",
-            tipo_preco,
+            f"Nenhuma coluna de preço {prefixo} encontrada. "
+            f"Colunas disponíveis: {list(df.columns)}"
         )
-
         return pd.DataFrame()
 
-    logging.info(
-        "Colunas de preço %s encontradas: %s",
-        tipo_preco,
-        colunas_preco,
-    )
+    # ── Tratar valores de preço ────────────────────────────────────
+    for col in colunas_preco_presentes:
+        resultados = df[col].apply(tratar_valor_preco)
+        df[col] = resultados.apply(lambda x: x[0])
+        # Flag de asterisco por coluna (consolidar depois)
+        df[f"_FLAG_{col}"] = resultados.apply(lambda x: x[1])
 
-    for col in colunas_preco:
+    # ── Colunas de identificação presentes ─────────────────────────
+    cols_id_presentes = [c for c in COLUNAS_IDENTIFICACAO if c in df.columns]
+    cols_ean = [c for c in ["EAN 1", "EAN 2", "EAN 3"] if c in df.columns]
 
-        resultados = df[col].apply(
-            tratar_valor_preco
-        )
-
-        df[col] = resultados.apply(
-            lambda x: x[0]
-        )
-
-        df[
-            f"_FLAG_{col}"
-        ] = resultados.apply(
-            lambda x: x[1]
-        )
-
-    cols_ean = [
-        c
-        for c in (
-            "EAN 1",
-            "EAN 2",
-            "EAN 3",
-        )
-        if c in df.columns
-    ]
-
+    # ── Explodir EANs (uma linha por EAN válido) ───────────────────
     registros = []
-
     for _, row in df.iterrows():
-
-        eans_validos = [
-            row.get(c)
-            for c in cols_ean
-            if row.get(c)
-            and pd.notna(row.get(c))
-        ]
+        eans_validos = []
+        for col_ean in cols_ean:
+            ean = row.get(col_ean)
+            if ean and pd.notna(ean):
+                eans_validos.append(ean)
 
         if not eans_validos:
             eans_validos = [None]
 
         for ean in eans_validos:
-
-            for col_preco in colunas_preco:
-
+            for col_preco in colunas_preco_presentes:
                 valor = row[col_preco]
-
-                if valor is None:
+                if valor is None or (isinstance(valor, float) and np.isnan(valor)):
                     continue
 
-                if (
-                    isinstance(valor, float)
-                    and np.isnan(valor)
-                ):
-                    continue
+                # Extrair alíquota do nome da coluna (ex: "PMC 17%" → "17%")
+                match_aliq = re.search(r"(\d+(?:,\d+)?%|Sem Impostos)", col_preco)
+                aliquota = match_aliq.group(1) if match_aliq else col_preco
 
-                match = re.search(
-                    r"(Sem Impostos|"
-                    r"\d+(?:,\d+)?%)",
-                    str(col_preco),
-                    re.IGNORECASE,
-                )
+                flag_ast = row.get(f"_FLAG_{col_preco}", False)
 
-                aliquota = (
-                    match.group(1)
-                    if match
-                    else str(col_preco)
-                )
-
-                aliquota = aliquota.strip()
-
-                ufs = MAPEAMENTO_ICMS_UF.get(
-                    aliquota,
-                    [],
-                )
+                # Mapear alíquota → UFs
+                ufs = MAPEAMENTO_ICMS_UF.get(aliquota, [])
 
                 if not ufs:
+                    # Se não há mapeamento (ex: "Sem Impostos" ou alíquota nova),
+                    # gerar linha sem UF específica
                     ufs = [None]
 
                 for uf in ufs:
+                    registros.append({
+                        "EAN": ean,
+                        "CODIGO_GGREM": row.get("CÓDIGO GGREM"),
+                        "PRODUTO": row.get("PRODUTO"),
+                        "APRESENTACAO": row.get("APRESENTAÇÃO"),
+                        "LABORATORIO": row.get("LABORATÓRIO"),
+                        "SUBSTANCIA": row.get("SUBSTÂNCIA"),
+                        "TIPO_PRECO": tipo_preco,
+                        "ALIQUOTA_ICMS": aliquota,
+                        "ESTADO_UF": uf,
+                        "VALOR": valor,
+                        "FLAG_ASTERISCO": bool(flag_ast),
+                        "EAN_INVALIDO": not validar_ean13(ean) if ean else True,
+                        "COMPETENCIA": competencia,
+                        "DATA_REFERENCIA": competencia + "-01",
+                        "DATA_CARGA": data_carga.isoformat(),
+                    })
 
-                    registros.append(
-                        {
-                            "EAN": ean,
-                            "CODIGO_GGREM": row.get(
-                                "CÓDIGO GGREM"
-                            ),
-                            "PRODUTO": row.get(
-                                "PRODUTO"
-                            ),
-                            "APRESENTACAO": row.get(
-                                "APRESENTAÇÃO"
-                            ),
-                            "LABORATORIO": row.get(
-                                "LABORATÓRIO"
-                            ),
-                            "SUBSTANCIA": row.get(
-                                "SUBSTÂNCIA"
-                            ),
-                            "TIPO_PRECO": tipo_preco,
-                            "ALIQUOTA_ICMS": aliquota,
-                            "ESTADO_UF": uf,
-                            "VALOR": valor,
-                            "FLAG_ASTERISCO": bool(
-                                row.get(
-                                    f"_FLAG_{col_preco}",
-                                    False,
-                                )
-                            ),
-                            "EAN_INVALIDO": (
-                                not validar_ean13(ean)
-                                if ean
-                                else True
-                            ),
-                            "COMPETENCIA": competencia,
-                            "DATA_REFERENCIA": (
-                                f"{competencia}-01"
-                            ),
-                            "DATA_CARGA": (
-                                data_carga.isoformat()
-                            ),
-                        }
-                    )
-
-    resultado = pd.DataFrame(
-        registros
-    )
-
+    df_resultado = pd.DataFrame(registros)
     logging.info(
-        "%s processado: %s registros "
-        "(%s linhas originais).",
-        tipo_preco,
-        len(resultado),
-        len(df),
+        f"{tipo_preco} processado: {len(df_resultado)} registros "
+        f"({len(df)} linhas originais)."
     )
+    return df_resultado
 
-    return resultado
+
+# ═══════════════════════════════════════════════════════════════════════
+# 3. MODELAGEM — Dimensões e Fato
+# ═══════════════════════════════════════════════════════════════════════
 
 
-# ============================================================================
-# DIMENSÃO MEDICAMENTO
-# ============================================================================
-
-def gerar_dimensao_medicamento(
-    df_raw: pd.DataFrame,
-) -> pd.DataFrame:
+def gerar_dimensao_medicamento(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """Gera tabela dimensão dMedicamento a partir do DataFrame original."""
 
     cols_dim = {
         "EAN 1": "EAN",
@@ -1599,172 +795,86 @@ def gerar_dimensao_medicamento(
         "SUBSTÂNCIA": "SUBSTANCIA",
         "LABORATÓRIO": "LABORATORIO",
         "CNPJ": "CNPJ",
-        "CLASSE TERAPÊUTICA":
-            "CLASSE_TERAPEUTICA",
-        "F.FARMACÊUTICA":
-            "F_FARMACEUTICA",
-        "REGIME DE PREÇO":
-            "REGIME_PRECO",
+        "CLASSE TERAPÊUTICA": "CLASSE_TERAPEUTICA",
+        "F.FARMACÊUTICA": "F_FARMACEUTICA",
+        "REGIME DE PREÇO": "REGIME_PRECO",
         "TARJA": "TARJA",
-        "RESTRIÇÃO HOSPITALAR":
-            "RESTRICAO_HOSPITALAR",
+        "RESTRIÇÃO HOSPITALAR": "RESTRICAO_HOSPITALAR",
         "CAP": "CAP",
-        "TIPO DE PRODUTO (STATUS DO PRODUTO)":
-            "TIPO_PRODUTO",
+        "TIPO DE PRODUTO (STATUS DO PRODUTO)": "TIPO_PRODUTO",
     }
 
-    presentes = {
-        k: v
-        for k, v in cols_dim.items()
-        if k in df_raw.columns
-    }
+    # Selecionar colunas presentes
+    cols_presentes = {k: v for k, v in cols_dim.items() if k in df_raw.columns}
+    df_dim = df_raw[list(cols_presentes.keys())].copy()
+    df_dim.rename(columns=cols_presentes, inplace=True)
 
-    df_dim = df_raw[
-        list(presentes.keys())
-    ].copy()
-
-    df_dim.rename(
-        columns=presentes,
-        inplace=True,
-    )
-
+    # Tratar EAN
     if "EAN" in df_dim.columns:
-        df_dim["EAN"] = df_dim[
-            "EAN"
-        ].apply(tratar_ean)
+        df_dim["EAN"] = df_dim["EAN"].apply(tratar_ean)
 
-    df_dim.dropna(
-        subset=["EAN"],
-        inplace=True,
-    )
+    # Deduplica por EAN (mantém primeiro registro)
+    df_dim.dropna(subset=["EAN"], inplace=True)
+    df_dim.drop_duplicates(subset=["EAN"], keep="first", inplace=True)
 
-    df_dim.drop_duplicates(
-        subset=["EAN"],
-        keep="first",
-        inplace=True,
-    )
-
+    # Converter restrição hospitalar para booleano
     if "RESTRICAO_HOSPITALAR" in df_dim.columns:
-
-        df_dim[
-            "RESTRICAO_HOSPITALAR"
-        ] = df_dim[
-            "RESTRICAO_HOSPITALAR"
-        ].apply(
-            lambda x:
-                str(x).strip().upper()
-                in (
-                    "SIM",
-                    "S",
-                    "TRUE",
-                    "1",
-                    "X",
-                )
-                if pd.notna(x)
-                else False
+        df_dim["RESTRICAO_HOSPITALAR"] = df_dim["RESTRICAO_HOSPITALAR"].apply(
+            lambda x: str(x).strip().upper() in ("SIM", "S", "TRUE", "1", "X")
+            if pd.notna(x) else False
         )
 
-    df_dim.reset_index(
-        drop=True,
-        inplace=True,
-    )
-
+    df_dim.reset_index(drop=True, inplace=True)
+    logging.info(f"Dimensão medicamento: {len(df_dim)} produtos únicos por EAN.")
     return df_dim
 
 
-# ============================================================================
-# DIMENSÃO ESTADO
-# ============================================================================
-
 def gerar_dimensao_estado() -> pd.DataFrame:
-
+    """Gera tabela dimensão dEstado."""
+    registros = []
+    # Montar mapa inverso: UF → alíquota
     uf_aliquota = {}
-
     for aliq, ufs in MAPEAMENTO_ICMS_UF.items():
-
         for uf in ufs:
             uf_aliquota[uf] = aliq
 
-    return pd.DataFrame(
-        [
-            {
-                "ESTADO_UF": uf,
-                "NOME_ESTADO": nome,
-                "REGIAO": regiao,
-                "ALIQUOTA_ICMS_VIGENTE":
-                    uf_aliquota.get(
-                        uf,
-                        "",
-                    ),
-            }
-            for uf, (
-                nome,
-                regiao,
-            ) in ESTADOS_BRASIL.items()
-        ]
-    )
+    for uf, (nome, regiao) in ESTADOS_BRASIL.items():
+        registros.append({
+            "ESTADO_UF": uf,
+            "NOME_ESTADO": nome,
+            "REGIAO": regiao,
+            "ALIQUOTA_ICMS_VIGENTE": uf_aliquota.get(uf, ""),
+        })
 
+    return pd.DataFrame(registros)
 
-# ============================================================================
-# DIMENSÃO CALENDÁRIO
-# ============================================================================
 
 def gerar_dimensao_calendario(
     data_inicio: str = "2024-01-01",
+    data_fim: str = "2027-12-31",
 ) -> pd.DataFrame:
-
-    ano_atual = datetime.now().year
-
-    data_fim = (
-        f"{ano_atual + 1}-12-31"
-    )
-
-    datas = pd.date_range(
-        start=data_inicio,
-        end=data_fim,
-        freq="D",
-    )
-
-    df = pd.DataFrame(
-        {
-            "DATA": datas
-        }
-    )
-
-    df["ANO"] = (
-        df["DATA"].dt.year
-    )
-
-    df["MES"] = (
-        df["DATA"].dt.month
-    )
-
-    df["NOME_MES"] = (
-        df["DATA"]
-        .dt.strftime("%B")
-        .str.capitalize()
-    )
-
-    df["TRIMESTRE"] = (
-        df["DATA"].dt.quarter
-    )
-
-    df["COMPETENCIA"] = (
-        df["DATA"]
-        .dt.strftime("%Y-%m")
-    )
-
-    df["DATA"] = (
-        df["DATA"]
-        .dt.strftime("%Y-%m-%d")
-    )
-
+    """Gera tabela dimensão dCalendario."""
+    meses_pt = {
+        1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
+        5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto",
+        9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro",
+    }
+    datas = pd.date_range(start=data_inicio, end=data_fim, freq="D")
+    df = pd.DataFrame({"DATA": datas})
+    df["ANO"] = df["DATA"].dt.year
+    df["MES"] = df["DATA"].dt.month
+    # Não usar strftime("%B"): depende do locale do SO (sai em inglês no CI).
+    df["NOME_MES"] = df["MES"].map(meses_pt)
+    df["TRIMESTRE"] = df["DATA"].dt.quarter
+    df["COMPETENCIA"] = df["DATA"].dt.strftime("%Y-%m")
+    df["DATA"] = df["DATA"].dt.strftime("%Y-%m-%d")
     return df
 
 
-# ============================================================================
-# EXPORTAÇÃO
-# ============================================================================
+# ═══════════════════════════════════════════════════════════════════════
+# 4. EXPORTAÇÃO
+# ═══════════════════════════════════════════════════════════════════════
+
 
 def exportar_para_powerbi(
     df_fato: pd.DataFrame,
@@ -1774,572 +884,174 @@ def exportar_para_powerbi(
     diretorio: str,
     modo_historico: bool = True,
 ) -> dict:
+    """
+    Exporta DataFrames para CSV (utf-8-sig) prontos para o Power BI.
+    Se modo_historico=True, faz append à tabela fato existente.
+    """
+    dir_saida = Path(diretorio)
+    dir_saida.mkdir(parents=True, exist_ok=True)
 
-    dir_saida = Path(
-        diretorio
-    )
-
-    dir_saida.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    encoding = "utf-8-sig"
-
+    encoding = "utf-8-sig"  # compatível com Excel e Power BI
     arquivos = {}
 
-    # ------------------------------------------------------------------
-    # FATO
-    # ------------------------------------------------------------------
-
-    caminho_fato = (
-        dir_saida / "fato_precos.csv"
-    )
-
-    if (
-        modo_historico
-        and caminho_fato.exists()
-    ):
-
-        df_existente = pd.read_csv(
-            caminho_fato,
-            dtype=str,
-            encoding=encoding,
-        )
-
-        chave = [
-            "EAN",
-            "ESTADO_UF",
-            "TIPO_PRECO",
-            "COMPETENCIA",
-            "ALIQUOTA_ICMS",
-        ]
-
+    # ── Fato: append (histórico) ───────────────────────────────────
+    caminho_fato = dir_saida / "fato_precos.csv"
+    if modo_historico and caminho_fato.exists():
+        df_existente = pd.read_csv(caminho_fato, dtype=str, encoding=encoding)
+        # Evitar duplicatas pela combinação EAN+UF+TIPO+COMPETENCIA+ALIQUOTA
+        chave = ["EAN", "ESTADO_UF", "TIPO_PRECO", "COMPETENCIA", "ALIQUOTA_ICMS"]
         chaves_existentes = set(
-            df_existente[chave].apply(
-                lambda r:
-                    "|".join(
-                        str(v)
-                        for v in r
-                    ),
-                axis=1,
-            )
+            df_existente[chave].apply(lambda r: "|".join(str(v) for v in r), axis=1)
         )
-
-        mask_novos = (
-            df_fato[chave]
-            .apply(
-                lambda r:
-                    "|".join(
-                        str(v)
-                        for v in r
-                    ),
-                axis=1,
-            )
-            .apply(
-                lambda x:
-                    x not in chaves_existentes
-            )
-        )
-
-        df_novos = df_fato[
-            mask_novos
-        ]
-
+        mask_novos = df_fato[chave].apply(
+            lambda r: "|".join(str(v) for v in r), axis=1
+        ).apply(lambda x: x not in chaves_existentes)
+        df_novos = df_fato[mask_novos]
         if len(df_novos) > 0:
-
-            df_final = pd.concat(
-                [
-                    df_existente,
-                    df_novos,
-                ],
-                ignore_index=True,
-            )
-
+            df_final = pd.concat([df_existente, df_novos], ignore_index=True)
             logging.info(
-                "Histórico: %s registros "
-                "novos adicionados "
-                "(total: %s).",
-                len(df_novos),
-                len(df_final),
+                f"Histórico: {len(df_novos)} registros novos adicionados "
+                f"(total: {len(df_final)})."
             )
-
         else:
-
             df_final = df_existente
-
-            logging.info(
-                "Nenhum registro novo."
-            )
-
+            logging.info("Nenhum registro novo — dados já existem no histórico.")
     else:
         df_final = df_fato
 
-    df_final.to_csv(
-        caminho_fato,
-        index=False,
-        encoding=encoding,
-    )
+    df_final.to_csv(caminho_fato, index=False, encoding=encoding)
+    arquivos["fato_precos"] = caminho_fato
 
-    arquivos[
-        "fato_precos"
-    ] = caminho_fato
-
-    # ------------------------------------------------------------------
-    # MEDICAMENTO
-    # ------------------------------------------------------------------
-
-    caminho_med = (
-        dir_saida
-        / "dim_medicamento.csv"
-    )
-
+    # ── Dimensões (sobrescrever — são estáticas/acumulativas) ──────
+    caminho_med = dir_saida / "dim_medicamento.csv"
     if caminho_med.exists():
-
-        df_med_existente = pd.read_csv(
-            caminho_med,
-            dtype=str,
-            encoding=encoding,
-        )
-
+        df_med_existente = pd.read_csv(caminho_med, dtype=str, encoding=encoding)
         df_medicamento = pd.concat(
-            [
-                df_med_existente,
-                df_medicamento,
-            ],
-            ignore_index=True,
+            [df_med_existente, df_medicamento], ignore_index=True
         )
+        df_medicamento.drop_duplicates(subset=["EAN"], keep="last", inplace=True)
 
-        df_medicamento.drop_duplicates(
-            subset=["EAN"],
-            keep="last",
-            inplace=True,
-        )
+    df_medicamento.to_csv(caminho_med, index=False, encoding=encoding)
+    arquivos["dim_medicamento"] = caminho_med
 
-    df_medicamento.to_csv(
-        caminho_med,
-        index=False,
-        encoding=encoding,
-    )
+    caminho_est = dir_saida / "dim_estado.csv"
+    df_estado.to_csv(caminho_est, index=False, encoding=encoding)
+    arquivos["dim_estado"] = caminho_est
 
-    arquivos[
-        "dim_medicamento"
-    ] = caminho_med
+    caminho_cal = dir_saida / "dim_calendario.csv"
+    df_calendario.to_csv(caminho_cal, index=False, encoding=encoding)
+    arquivos["dim_calendario"] = caminho_cal
 
-    # ------------------------------------------------------------------
-    # ESTADO
-    # ------------------------------------------------------------------
-
-    caminho_est = (
-        dir_saida / "dim_estado.csv"
-    )
-
-    df_estado.to_csv(
-        caminho_est,
-        index=False,
-        encoding=encoding,
-    )
-
-    arquivos[
-        "dim_estado"
-    ] = caminho_est
-
-    # ------------------------------------------------------------------
-    # CALENDÁRIO
-    # ------------------------------------------------------------------
-
-    caminho_cal = (
-        dir_saida
-        / "dim_calendario.csv"
-    )
-
-    df_calendario.to_csv(
-        caminho_cal,
-        index=False,
-        encoding=encoding,
-    )
-
-    arquivos[
-        "dim_calendario"
-    ] = caminho_cal
+    for nome, caminho in arquivos.items():
+        tam = Path(caminho).stat().st_size
+        logging.info(f"Exportado: {caminho} ({tam:,} bytes)")
 
     return arquivos
 
 
-# ============================================================================
-# ORQUESTRADOR
-# ============================================================================
+# ═══════════════════════════════════════════════════════════════════════
+# 5. ORQUESTRADOR PRINCIPAL
+# ═══════════════════════════════════════════════════════════════════════
+
 
 def main():
-
-    parser = argparse.ArgumentParser(
-        description="ETL CMED → Power BI"
-    )
-
-    parser.add_argument(
-        "--config",
-        default="config.yaml",
-        help="Caminho do config.yaml",
-    )
-
-    parser.add_argument(
-        "--competencia",
-        default=None,
-        help="Competência forçada (YYYY-MM)",
-    )
-
+    """Orquestrador principal do ETL CMED."""
+    parser = argparse.ArgumentParser(description="ETL CMED → Power BI")
+    parser.add_argument("--config", default="config.yaml", help="Caminho do config.yaml")
+    parser.add_argument("--competencia", default=None, help="Competência forçada (YYYY-MM)")
     args = parser.parse_args()
 
-    config = carregar_config(
-        args.config
-    )
+    config = carregar_config(args.config)
+    configurar_log(config)
 
-    configurar_log(
-        config
-    )
+    # Sessão HTTP única e resiliente, reaproveitada em todos os downloads.
+    config["_sessao"] = criar_sessao_http(config)
+    estado = carregar_estado(config)
 
     inicio = datetime.now()
+    logging.info("=" * 70)
+    logging.info(f"INÍCIO ETL CMED — {inicio.isoformat()}")
+    logging.info("=" * 70)
 
     try:
-
-        # ==============================================================
-        # 1. DESCOBRIR LINKS
-        # ==============================================================
-
-        links = obter_links_cmed(
-            config
-        )
+        # 1. Obter links
+        links = obter_links_cmed(config)
 
         if not links.get("PMC"):
-            raise RuntimeError(
-                "Link do arquivo PMC não encontrado."
-            )
+            raise RuntimeError("Link do arquivo PMC não encontrado na página CMED.")
+        if not links.get("PF"):
+            raise RuntimeError("Link do arquivo PF/PMVG não encontrado na página CMED.")
 
-        if not links.get("PMVG"):
-            raise RuntimeError(
-                "Link do arquivo PMVG não encontrado."
-            )
-
-        # ==============================================================
-        # 2. COMPETÊNCIA
-        # ==============================================================
-
-        if args.competencia:
-
-            if not re.fullmatch(
-                r"20\d{2}-(0[1-9]|1[0-2])",
-                args.competencia,
-            ):
-                raise ValueError(
-                    "Competência inválida. "
-                    "Use YYYY-MM, por exemplo 2026-07."
-                )
-
-            competencia_execucao = (
-                args.competencia
-            )
-
-            logging.info(
-                "Modo manual: competência forçada: %s",
-                competencia_execucao,
-            )
-
-            arquivo_pmc = baixar_arquivo_cmed(
-                links["PMC"],
-                "PMC",
-                config,
-                competencia_execucao,
-            )
-
-        else:
-
-            arquivo_pmc = baixar_arquivo_cmed(
-                links["PMC"],
-                "PMC",
-                config,
-            )
-
-            competencia_execucao = (
-                extrair_competencia_do_arquivo(
-                    arquivo_pmc
-                )
-            )
-
-            logging.info(
-                "Modo automático: competência "
-                "descoberta no arquivo PMC: %s",
-                competencia_execucao,
-            )
-
-        # ==============================================================
-        # 3. BAIXAR PMVG
-        # ==============================================================
-
-        arquivo_pmvg = baixar_arquivo_cmed(
-            links["PMVG"],
-            "PMVG",
-            config,
-            competencia_execucao,
+        # 2. Download
+        arquivo_pmc = baixar_arquivo_cmed(
+            links["PMC"], "PMC", config, args.competencia
+        )
+        arquivo_pf = baixar_arquivo_cmed(
+            links["PF"], "PF", config, args.competencia
         )
 
-        # ==============================================================
-        # 4. HASH
-        # ==============================================================
+        # 3. Leitura
+        df_raw_pmc = ler_arquivo_cmed(arquivo_pmc)
+        df_raw_pf = ler_arquivo_cmed(arquivo_pf)
 
-        hashes = {
-            "PMC": calcular_hash_arquivo(
-                arquivo_pmc
-            ),
-            "PMVG": calcular_hash_arquivo(
-                arquivo_pmvg
-            ),
-        }
+        # 4. Processamento (unpivot + mapeamento UF)
+        df_fato_pmc = processar_tabela_precos(df_raw_pmc, arquivo_pmc, "PMC")
+        df_fato_pf = processar_tabela_precos(df_raw_pf, arquivo_pf, "PF")
 
-        logging.info(
-            "SHA-256 PMC : %s",
-            hashes["PMC"],
-        )
+        # 5. Combinar fato
+        df_fato = pd.concat([df_fato_pmc, df_fato_pf], ignore_index=True)
+        logging.info(f"Tabela fato combinada: {len(df_fato)} registros.")
 
-        logging.info(
-            "SHA-256 PMVG: %s",
-            hashes["PMVG"],
-        )
+        # 6. Dimensões
+        df_medicamento = gerar_dimensao_medicamento(df_raw_pmc)
+        df_estado = gerar_dimensao_estado()
+        df_calendario = gerar_dimensao_calendario()
 
-        # ==============================================================
-        # 5. ESTADO
-        # ==============================================================
-
-        estado = carregar_estado(
-            config["arquivo_estado"]
-        )
-
-        if estado_ja_processado(
-            estado,
-            competencia_execucao,
-            hashes,
-        ):
-
-            duracao = (
-                datetime.now() - inicio
-            ).total_seconds()
-
-            logging.info(
-                "ETL encerrado sem alterações "
-                "em %.1fs.",
-                duracao,
-            )
-
-            return
-
-        logging.info(
-            "Nova versão CMED detectada para %s. "
-            "Continuando processamento.",
-            competencia_execucao,
-        )
-
-        # ==============================================================
-        # 6. LEITURA
-        # ==============================================================
-
-        df_raw_pmc = ler_arquivo_cmed(
-            arquivo_pmc
-        )
-
-        df_raw_pmvg = ler_arquivo_cmed(
-            arquivo_pmvg
-        )
-
-        # ==============================================================
-        # 7. TRANSFORMAÇÃO
-        # ==============================================================
-
-        df_fato_pmc = (
-            processar_tabela_precos(
-                df_raw_pmc,
-                arquivo_pmc,
-                "PMC",
-                competencia_execucao,
-            )
-        )
-
-        # IMPORTANTE:
-        # O arquivo PMVG contém informações de PMVG/PF.
-        # Primeiro tentamos PMVG.
-        df_fato_pmvg = (
-            processar_tabela_precos(
-                df_raw_pmvg,
-                arquivo_pmvg,
-                "PMVG",
-                competencia_execucao,
-            )
-        )
-
-        # Se a versão atual da planilha não possuir
-        # colunas PMVG, tentamos PF.
-        if df_fato_pmvg.empty:
-
-            logging.warning(
-                "Nenhuma coluna PMVG encontrada. "
-                "Tentando extrair PF do arquivo PMVG."
-            )
-
-            df_fato_pmvg = (
-                processar_tabela_precos(
-                    df_raw_pmvg,
-                    arquivo_pmvg,
-                    "PF",
-                    competencia_execucao,
-                )
-            )
-
-        df_fato = pd.concat(
-            [
-                df_fato_pmc,
-                df_fato_pmvg,
-            ],
-            ignore_index=True,
-        )
-
-        if df_fato.empty:
-            raise RuntimeError(
-                "Nenhum registro de preço foi produzido "
-                "pelos arquivos CMED."
-            )
-
-        # ==============================================================
-        # 8. DIMENSÕES
-        # ==============================================================
-
-        # PMC normalmente possui a identificação principal
-        # dos medicamentos. Caso necessário, usamos PMVG como fallback.
-        if len(df_raw_pmc) >= len(df_raw_pmvg):
-            df_base_medicamento = df_raw_pmc
-        else:
-            df_base_medicamento = df_raw_pmvg
-
-        df_medicamento = (
-            gerar_dimensao_medicamento(
-                df_base_medicamento
-            )
-        )
-
-        df_estado = (
-            gerar_dimensao_estado()
-        )
-
-        df_calendario = (
-            gerar_dimensao_calendario()
-        )
-
-        # ==============================================================
-        # 9. EXPORTAÇÃO
-        # ==============================================================
-
+        # 7. Exportação
         arquivos = exportar_para_powerbi(
-            df_fato,
-            df_medicamento,
-            df_estado,
-            df_calendario,
+            df_fato, df_medicamento, df_estado, df_calendario,
             config["diretorio_saida"],
         )
 
-        # ==============================================================
-        # 10. BACKUP
-        # ==============================================================
-
-        dir_hist = Path(
-            config["diretorio_historico"]
-        )
-
-        dir_hist.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
+        # 8. Backup histórico
+        dir_hist = Path(config["diretorio_historico"])
+        dir_hist.mkdir(parents=True, exist_ok=True)
+        competencia = extrair_competencia_do_arquivo(arquivo_pmc)
         for nome, caminho in arquivos.items():
+            backup = dir_hist / f"{nome}_{competencia}.csv"
+            import shutil
+            shutil.copy2(caminho, backup)
+            logging.info(f"Backup: {backup}")
 
-            backup = (
-                dir_hist
-                / f"{nome}_{competencia_execucao}.csv"
-            )
+        # 9. Registrar estado (última execução bem-sucedida).
+        estado.update({
+            "ultima_competencia": competencia,
+            "ultima_execucao": datetime.now().isoformat(),
+            "registros_fato": int(len(df_fato)),
+        })
+        salvar_estado(config, estado)
 
-            shutil.copy2(
-                caminho,
-                backup,
-            )
-
-            logging.info(
-                "Backup: %s",
-                backup,
-            )
-
-        # ==============================================================
-        # 11. ATUALIZAR ESTADO
-        # ==============================================================
-
-        novo_estado = {
-            "competencia": competencia_execucao,
-            "hashes": hashes,
-            "arquivos": {
-                "PMC": arquivo_pmc.name,
-                "PMVG": arquivo_pmvg.name,
-            },
-            "urls": {
-                "PMC": links["PMC"],
-                "PMVG": links["PMVG"],
-            },
-            "processado_em": datetime.now().isoformat(),
-            "registros_fato": int(
-                len(df_fato)
-            ),
-        }
-
-        salvar_estado(
-            config["arquivo_estado"],
-            novo_estado,
-        )
-
-        # ==============================================================
-        # 12. FINALIZAÇÃO
-        # ==============================================================
-
-        duracao = (
-            datetime.now() - inicio
-        ).total_seconds()
-
+        fim = datetime.now()
+        duracao = (fim - inicio).total_seconds()
+        logging.info("=" * 70)
         logging.info(
-            "ETL CMED CONCLUÍDO COM SUCESSO — "
-            "competência=%s duração=%.1fs registros=%s",
-            competencia_execucao,
-            duracao,
-            len(df_fato),
+            f"ETL CMED CONCLUÍDO COM SUCESSO — "
+            f"duração: {duracao:.1f}s — {len(df_fato)} registros na fato."
         )
+        logging.info("=" * 70)
 
         enviar_alerta_email(
             config,
-            f"Sucesso — {competencia_execucao}",
-            (
-                "ETL CMED concluído com sucesso.\n"
-                f"Competência: {competencia_execucao}\n"
-                f"Registros fato: {len(df_fato)}\n"
-                f"Duração: {duracao:.1f}s"
-            ),
+            f"Sucesso — {competencia}",
+            f"ETL CMED concluído com sucesso.\n"
+            f"Competência: {competencia}\n"
+            f"Registros fato: {len(df_fato)}\n"
+            f"Duração: {duracao:.1f}s",
         )
 
-    except Exception as exc:
-
-        logging.critical(
-            "FALHA NO ETL CMED: %s",
-            exc,
-            exc_info=True,
-        )
-
-        enviar_alerta_email(
-            config,
-            "FALHA NO ETL",
-            str(exc),
-        )
-
+    except Exception as e:
+        logging.critical(f"FALHA NO ETL CMED: {e}", exc_info=True)
+        enviar_alerta_email(config, "FALHA NO ETL", str(e))
         sys.exit(1)
 
 
