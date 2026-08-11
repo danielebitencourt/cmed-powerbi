@@ -1,3 +1,11 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Configuração do ETL CMED
+# IMPORTANTE (segurança): NÃO coloque senhas ou tokens neste arquivo.
+# Ele fica versionado no GitHub. Credenciais de e-mail (se usar alertas)
+# devem ir em GitHub Secrets e são lidas por variáveis de ambiente:
+#   SMTP_REMETENTE, SMTP_SENHA, SMTP_DESTINATARIOS, EMAIL_ALERTA_ATIVO
+# ═══════════════════════════════════════════════════════════════════════
+
 url_cmed: "https://www.gov.br/anvisa/pt-br/assuntos/medicamentos/cmed/precos"
 
 diretorio_saida: "dados/processed"
@@ -11,4 +19,14 @@ timeout_segundos: 90
 tentativas_max: 3
 intervalo_retry_segundos: 30
 
-user_agent: "Mozilla/5.0 GitHub Actions CMED ETL"
+user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+# Alertas por e-mail ficam desativados por padrão.
+# Para ativar, defina EMAIL_ALERTA_ATIVO=true nos Secrets (não aqui).
+email_alerta:
+  ativo: false
+  smtp_host: "smtp.gmail.com"
+  smtp_porta: 587
+  remetente: ""       # preenchido via Secret SMTP_REMETENTE
+  senha: ""           # preenchido via Secret SMTP_SENHA
+  destinatarios: []   # preenchido via Secret SMTP_DESTINATARIOS
