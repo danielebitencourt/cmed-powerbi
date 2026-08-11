@@ -1,0 +1,12 @@
+url_cmed: "https://www.gov.br/anvisa/pt-br/assuntos/medicamentos/cmed/precos"
+
+diretorio_saida: "dados/processed"
+diretorio_raw: "dados/raw"
+diretorio_historico: "dados/historico"
+diretorio_log: "logs"
+
+timeout_segundos: 90
+tentativas_max: 3
+intervalo_retry_segundos: 30
+
+user_agent: "Mozilla/5.0 GitHub Actions CMED ETL"
