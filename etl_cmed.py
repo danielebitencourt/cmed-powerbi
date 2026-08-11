@@ -30,6 +30,7 @@ from email.mime.text import MIMEText
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urljoin
 
 import numpy as np
 import pandas as pd
@@ -272,6 +273,9 @@ def criar_sessao_http(config: dict) -> requests.Session:
     sessao.mount("http://", adapter)
 
     # Cabeçalhos "de navegador" reduzem bloqueios do WAF do gov.br.
+    # NÃO forçamos Accept-Encoding: deixamos o requests anunciar apenas os
+    # formatos que sabe descomprimir (gzip/deflate). Forçar "br" (brotli)
+    # sem a lib instalada faz o corpo chegar ilegível e nenhum link é achado.
     sessao.headers.update({
         "User-Agent": config["user_agent"],
         "Accept": (
@@ -280,7 +284,6 @@ def criar_sessao_http(config: dict) -> requests.Session:
             "application/vnd.ms-excel,*/*;q=0.8"
         ),
         "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
     })
@@ -340,45 +343,56 @@ def obter_links_cmed(config: dict) -> dict:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
+    def absolutizar(href: str) -> str:
+        href = href.strip()
+        if href.startswith("http"):
+            return href
+        if href.startswith("//"):
+            return "https:" + href
+        if href.startswith("/"):
+            return "https://www.gov.br" + href
+        return urljoin(url.rstrip("/") + "/", href)
+
     links_encontrados = {"PMC": None, "PF": None}
 
-    # Procurar todos os links na página
+    # A CMED (Plone) publica URLs no formato:
+    #   .../arquivos/xls_conformidade_site_AAAAMMDD_xxxx.xlsx/@@download/file  → PMC
+    #   .../arquivos/xls_conformidade_gov_AAAAMMDD_xxxx.xlsx/@@download/file   → PMVG/PF
+    # IMPORTANTE: a URL termina em "/@@download/file", NÃO em ".xlsx".
+    # Por isso detectamos pelo PADRÃO DO NOME (regex), sem exigir extensão final.
     for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        texto = a.get_text(strip=True).lower()
-
-        # PMC — arquivo "site" (xls_conformidade_site_*)
-        if "xls_conformidade_site" in href or ("pmc" in texto and ".xls" in href):
-            if href.endswith((".xlsx", ".xls")):
-                links_encontrados["PMC"] = href if href.startswith("http") else (
-                    f"https://www.gov.br{href}"
-                )
-
-        # PF/PMVG — arquivo "gov" (xls_conformidade_gov_*)
-        if "xls_conformidade_gov" in href or ("pmvg" in texto and ".xls" in href):
-            if href.endswith((".xlsx", ".xls")):
-                links_encontrados["PF"] = href if href.startswith("http") else (
-                    f"https://www.gov.br{href}"
-                )
-
-    # Fallback: procurar links que contenham padrão de data no nome
-    if not links_encontrados["PMC"] or not links_encontrados["PF"]:
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if re.search(r"xls_conformidade_site_\d{8}", href):
-                links_encontrados["PMC"] = href if href.startswith("http") else (
-                    f"https://www.gov.br{href}"
-                )
-            if re.search(r"xls_conformidade_gov_\d{8}", href):
-                links_encontrados["PF"] = href if href.startswith("http") else (
-                    f"https://www.gov.br{href}"
-                )
+        href = a["href"]
+        if links_encontrados["PMC"] is None and re.search(r"xls_conformidade_site_\d{8}", href):
+            links_encontrados["PMC"] = absolutizar(href)
+        if links_encontrados["PF"] is None and re.search(r"xls_conformidade_gov_\d{8}", href):
+            links_encontrados["PF"] = absolutizar(href)
 
     for tipo, link in links_encontrados.items():
         if link:
             logging.info(f"Link {tipo} encontrado: {link}")
         else:
             logging.warning(f"Link {tipo} NÃO encontrado na página.")
+
+    # Diagnóstico quando algo falta: distingue "página real sem o padrão"
+    # de "página de bloqueio/consentimento do gov.br".
+    if not links_encontrados["PMC"] or not links_encontrados["PF"]:
+        total_links = len(soup.find_all("a", href=True))
+        tem_conformidade = "conformidade" in resp.text.lower()
+        logging.error(
+            f"Diagnóstico: {total_links} links na página | "
+            f"'conformidade' presente no HTML: {tem_conformidade} | "
+            f"tamanho do HTML: {len(resp.text)} bytes. "
+            "Se 'conformidade' for False, o gov.br provavelmente entregou uma "
+            "página de bloqueio/anti-bot (comum em IP de datacenter da CI)."
+        )
+        try:
+            dir_log = Path(config.get("diretorio_log", "logs"))
+            dir_log.mkdir(parents=True, exist_ok=True)
+            debug_path = dir_log / "cmed_pagina_debug.html"
+            debug_path.write_text(resp.text, encoding="utf-8")
+            logging.error(f"HTML da resposta salvo em: {debug_path}")
+        except OSError as e:
+            logging.warning(f"Não foi possível salvar HTML de depuração: {e}")
 
     return links_encontrados
 
