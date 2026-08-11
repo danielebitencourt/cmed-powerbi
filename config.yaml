@@ -1,4 +1,3 @@
-```yaml
 url_cmed: "https://www.gov.br/anvisa/pt-br/assuntos/medicamentos/cmed/precos"
 
 diretorio_saida: "dados/processed"
@@ -13,4 +12,3 @@ tentativas_max: 3
 intervalo_retry_segundos: 30
 
 user_agent: "Mozilla/5.0 GitHub Actions CMED ETL"
-```
