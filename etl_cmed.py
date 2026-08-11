@@ -626,8 +626,11 @@ def processar_tabela_precos(
     df: pd.DataFrame,
     caminho: Path,
     tipo_preco: str,
+    competencia: Optional[str] = None,
 ) -> pd.DataFrame:
-    competencia = extrair_competencia_do_arquivo(caminho)
+    # Se a competência foi informada manualmente, ela tem prioridade.
+    # No modo automático, a competência é extraída do arquivo publicado.
+    competencia = competencia or extrair_competencia_do_arquivo(caminho)
     data_carga = datetime.now()
 
     logging.info(
@@ -965,29 +968,56 @@ def main():
                 "Link do arquivo PF/PMVG não encontrado na página CMED."
             )
 
-        # 2. Baixar PMC primeiro para descobrir a competência.
-        arquivo_pmc = baixar_arquivo_cmed(
-            links["PMC"],
-            "PMC",
-            config,
-            args.competencia,
-        )
+        # 2. Definir a competência.
+        #
+        # Modo automático:
+        #   - baixa o PMC;
+        #   - descobre a competência pelo nome do arquivo publicado pela CMED.
+        #
+        # Modo manual (--competencia YYYY-MM):
+        #   - usa exatamente a competência informada pelo usuário;
+        #   - não deixa o nome do arquivo substituir essa competência.
+        if args.competencia:
+            if not re.fullmatch(r"20\d{2}-(0[1-9]|1[0-2])", args.competencia):
+                raise ValueError(
+                    "Competência inválida. Use o formato YYYY-MM, por exemplo: 2026-07."
+                )
 
-        competencia_detectada = extrair_competencia_do_arquivo(
-            arquivo_pmc
-        )
+            competencia_execucao = args.competencia
 
-        logging.info(
-            "Competência detectada no arquivo PMC: %s",
-            competencia_detectada,
-        )
+            logging.info(
+                "Modo manual: competência forçada pelo parâmetro --competencia: %s",
+                competencia_execucao,
+            )
 
-        # 3. Baixar PF da mesma execução.
+            arquivo_pmc = baixar_arquivo_cmed(
+                links["PMC"],
+                "PMC",
+                config,
+                competencia_execucao,
+            )
+        else:
+            arquivo_pmc = baixar_arquivo_cmed(
+                links["PMC"],
+                "PMC",
+                config,
+            )
+
+            competencia_execucao = extrair_competencia_do_arquivo(
+                arquivo_pmc
+            )
+
+            logging.info(
+                "Modo automático: competência descoberta no arquivo PMC: %s",
+                competencia_execucao,
+            )
+
+        # 3. Baixar PF usando a mesma competência da execução.
         arquivo_pf = baixar_arquivo_cmed(
             links["PF"],
             "PF",
             config,
-            args.competencia,
+            competencia_execucao,
         )
 
         # 4. Calcular hashes ANTES de processar.
@@ -1004,7 +1034,7 @@ def main():
 
         if estado_ja_processado(
             estado,
-            competencia_detectada,
+            competencia_execucao,
             hashes,
         ):
             duracao = (datetime.now() - inicio).total_seconds()
@@ -1017,7 +1047,7 @@ def main():
         logging.info(
             "Nova versão CMED detectada para %s. "
             "Continuando processamento.",
-            competencia_detectada,
+            competencia_execucao,
         )
 
         # 6. Leitura.
@@ -1029,11 +1059,13 @@ def main():
             df_raw_pmc,
             arquivo_pmc,
             "PMC",
+            competencia_execucao,
         )
         df_fato_pf = processar_tabela_precos(
             df_raw_pf,
             arquivo_pf,
             "PF",
+            competencia_execucao,
         )
 
         df_fato = pd.concat(
@@ -1060,14 +1092,14 @@ def main():
         dir_hist.mkdir(parents=True, exist_ok=True)
 
         for nome, caminho in arquivos.items():
-            backup = dir_hist / f"{nome}_{competencia_detectada}.csv"
+            backup = dir_hist / f"{nome}_{competencia_execucao}.csv"
             shutil.copy2(caminho, backup)
             logging.info("Backup: %s", backup)
 
         # 11. SOMENTE após o processamento ter terminado com sucesso,
         # atualizar o estado.
         novo_estado = {
-            "competencia": competencia_detectada,
+            "competencia": competencia_execucao,
             "hashes": hashes,
             "arquivos": {
                 "PMC": arquivo_pmc.name,
@@ -1091,17 +1123,17 @@ def main():
         logging.info(
             "ETL CMED CONCLUÍDO COM SUCESSO — "
             "competência=%s duração=%.1fs registros=%s",
-            competencia_detectada,
+            competencia_execucao,
             duracao,
             len(df_fato),
         )
 
         enviar_alerta_email(
             config,
-            f"Sucesso — {competencia_detectada}",
+            f"Sucesso — {competencia_execucao}",
             (
                 "ETL CMED concluído com sucesso.\n"
-                f"Competência: {competencia_detectada}\n"
+                f"Competência: {competencia_execucao}\n"
                 f"Registros fato: {len(df_fato)}\n"
                 f"Duração: {duracao:.1f}s"
             ),
