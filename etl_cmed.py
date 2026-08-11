@@ -355,17 +355,47 @@ def obter_links_cmed(config: dict) -> dict:
 
     links_encontrados = {"PMC": None, "PF": None}
 
-    # A CMED (Plone) publica URLs no formato:
-    #   .../arquivos/xls_conformidade_site_AAAAMMDD_xxxx.xlsx/@@download/file  → PMC
-    #   .../arquivos/xls_conformidade_gov_AAAAMMDD_xxxx.xlsx/@@download/file   → PMVG/PF
-    # IMPORTANTE: a URL termina em "/@@download/file", NÃO em ".xlsx".
-    # Por isso detectamos pelo PADRÃO DO NOME (regex), sem exigir extensão final.
+    def texto_link(a) -> str:
+        t = a.get_text(" ", strip=True).lower()
+        return re.sub(r"\s+", " ", t)
+
+    # ── Estratégia 1: identificar pelo TEXTO do link (mais robusta) ──
+    # A página lista âncoras que começam com "PMC - xls ..." e "PMVG - xls ...".
+    # Isso independe do formato da URL, que pode vir como:
+    #   .../xls_conformidade_site_AAAAMMDD_xxxx.xlsx/@@download/file
+    #   .../resolveuid/<uuid>            (o Plone às vezes entrega assim)
+    #   .../xls_conformidade_site_...xlsx  (URL direta — ambiente local)
     for a in soup.find_all("a", href=True):
+        inicio = texto_link(a)[:30]
         href = a["href"]
-        if links_encontrados["PMC"] is None and re.search(r"xls_conformidade_site_\d{8}", href):
+        eh_xls = ("xls" in inicio) or href.lower().endswith((".xlsx", ".xls"))
+        if not eh_xls:
+            continue
+        if links_encontrados["PMC"] is None and re.search(r"\bpmc\b", inicio):
             links_encontrados["PMC"] = absolutizar(href)
-        if links_encontrados["PF"] is None and re.search(r"xls_conformidade_gov_\d{8}", href):
+        elif links_encontrados["PF"] is None and re.search(r"\bpmvg\b", inicio):
             links_encontrados["PF"] = absolutizar(href)
+
+    # ── Estratégia 2 (fallback): padrão do nome do arquivo no href ──
+    if not links_encontrados["PMC"] or not links_encontrados["PF"]:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if links_encontrados["PMC"] is None and re.search(r"xls_conformidade_site", href, re.I):
+                links_encontrados["PMC"] = absolutizar(href)
+            if links_encontrados["PF"] is None and re.search(r"xls_conformidade_gov", href, re.I):
+                links_encontrados["PF"] = absolutizar(href)
+
+    # ── Estratégia 3 (fallback amplo): qualquer .xls* com "conformidade" ──
+    if not links_encontrados["PMC"] or not links_encontrados["PF"]:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            h = href.lower()
+            if "conformidade" not in h or (".xls" not in h):
+                continue
+            if links_encontrados["PMC"] is None and "site" in h:
+                links_encontrados["PMC"] = absolutizar(href)
+            if links_encontrados["PF"] is None and "gov" in h:
+                links_encontrados["PF"] = absolutizar(href)
 
     for tipo, link in links_encontrados.items():
         if link:
@@ -373,8 +403,7 @@ def obter_links_cmed(config: dict) -> dict:
         else:
             logging.warning(f"Link {tipo} NÃO encontrado na página.")
 
-    # Diagnóstico quando algo falta: distingue "página real sem o padrão"
-    # de "página de bloqueio/consentimento do gov.br".
+    # Diagnóstico quando algo falta.
     if not links_encontrados["PMC"] or not links_encontrados["PF"]:
         total_links = len(soup.find_all("a", href=True))
         tem_conformidade = "conformidade" in resp.text.lower()
@@ -382,9 +411,20 @@ def obter_links_cmed(config: dict) -> dict:
             f"Diagnóstico: {total_links} links na página | "
             f"'conformidade' presente no HTML: {tem_conformidade} | "
             f"tamanho do HTML: {len(resp.text)} bytes. "
-            "Se 'conformidade' for False, o gov.br provavelmente entregou uma "
-            "página de bloqueio/anti-bot (comum em IP de datacenter da CI)."
+            "Se 'conformidade' for False, provavelmente é página de bloqueio/anti-bot."
         )
+        # Amostra dos links que mencionam xls/pmc/pmvg/conformidade — mostra o
+        # formato REAL de href recebido, para ajustar a regra se necessário.
+        amostras = []
+        for a in soup.find_all("a", href=True):
+            t = texto_link(a)[:40]
+            h = a["href"]
+            if any(k in (t + " " + h.lower()) for k in ("xls", "pmc", "pmvg", "conformidade")):
+                amostras.append(f"  texto={t!r} href={h[:160]!r}")
+            if len(amostras) >= 15:
+                break
+        if amostras:
+            logging.error("Amostra de links candidatos:\n" + "\n".join(amostras))
         try:
             dir_log = Path(config.get("diretorio_log", "logs"))
             dir_log.mkdir(parents=True, exist_ok=True)
@@ -413,24 +453,18 @@ def baixar_arquivo_cmed(
     sessao = config.get("_sessao") or criar_sessao_http(config)
     headers = {"Referer": config["url_cmed"]}
 
-    # Extrair competência do nome do arquivo (YYYYMMDD)
-    match_data = re.search(r"(\d{8})", url)
-    if match_data and not competencia:
-        data_str = match_data.group(1)
-        competencia = f"{data_str[:4]}-{data_str[4:6]}"
+    competencia_forcada = competencia
 
-    if not competencia:
-        competencia = datetime.now().strftime("%Y-%m")
-
-    # Diretório de destino
-    dir_raw = Path(config["diretorio_raw"]) / competencia
-    dir_raw.mkdir(parents=True, exist_ok=True)
-
-    # Nome do arquivo local
-    nome_arquivo = url.split("/")[-1]
-    if not nome_arquivo.endswith((".xlsx", ".xls")):
-        nome_arquivo = f"cmed_{tipo.lower()}_{competencia}.xlsx"
-    caminho_local = dir_raw / nome_arquivo
+    def _competencia_de(texto: Optional[str]) -> Optional[str]:
+        if not texto:
+            return None
+        m = re.search(r"(20\d{2})(0[1-9]|1[0-2])\d{2}", texto)  # AAAAMMDD
+        if m:
+            return f"{m.group(1)}-{m.group(2)}"
+        m = re.search(r"(20\d{2})-(0[1-9]|1[0-2])", texto)      # AAAA-MM
+        if m:
+            return f"{m.group(1)}-{m.group(2)}"
+        return None
 
     for tentativa in range(1, tentativas + 1):
         try:
@@ -439,6 +473,32 @@ def baixar_arquivo_cmed(
             )
             resp = sessao.get(url, headers=headers, timeout=timeout, stream=True)
             resp.raise_for_status()
+
+            # A URL de origem pode ser "resolveuid/<uuid>" (sem data). Descobrimos
+            # o nome/competência reais pelo Content-Disposition ou pela URL final
+            # após os redirecionamentos que o Plone faz.
+            content_disp = resp.headers.get("Content-Disposition", "")
+            nome_cd = None
+            m_cd = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^\";]+)"?', content_disp, re.I)
+            if m_cd:
+                nome_cd = m_cd.group(1)
+
+            competencia = (
+                competencia_forcada
+                or _competencia_de(nome_cd)
+                or _competencia_de(str(resp.url))
+                or _competencia_de(url)
+                or datetime.now().strftime("%Y-%m")
+            )
+
+            # Nome do arquivo local: prioriza Content-Disposition, depois URL final.
+            nome_arquivo = nome_cd or str(resp.url).split("/")[-1].split("?")[0]
+            if not nome_arquivo.lower().endswith((".xlsx", ".xls")):
+                nome_arquivo = f"cmed_{tipo.lower()}_{competencia}.xlsx"
+
+            dir_raw = Path(config["diretorio_raw"]) / competencia
+            dir_raw.mkdir(parents=True, exist_ok=True)
+            caminho_local = dir_raw / nome_arquivo
 
             with open(caminho_local, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=8192):
@@ -450,10 +510,21 @@ def baixar_arquivo_cmed(
                     f"Arquivo muito pequeno ({tamanho} bytes) — possível erro de download."
                 )
 
+            # Validação leve: XLSX é um ZIP (assinatura "PK"); XLS antigo começa
+            # com D0 CF 11 E0. Se vier HTML, é página de erro disfarçada.
+            with open(caminho_local, "rb") as fh:
+                assinatura = fh.read(4)
+            if assinatura[:2] not in (b"PK", b"\xd0\xcf"):
+                raise ValueError(
+                    "Conteúdo baixado não é um Excel válido (possível página de "
+                    f"erro). Primeiros bytes: {assinatura!r}"
+                )
+
             sha = calcular_hash_arquivo(caminho_local)
             logging.info(
                 f"Download {tipo} concluído: {caminho_local} "
-                f"({tamanho:,} bytes, SHA-256: {sha[:16]}...)"
+                f"({tamanho:,} bytes, competência {competencia}, "
+                f"SHA-256: {sha[:16]}...)"
             )
             return caminho_local
 
