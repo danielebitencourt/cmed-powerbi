@@ -40,11 +40,11 @@ jobs:
           pip install -r requirements.txt
 
       - name: Preparar diretórios
-        run: mkdir -p dados/raw dados/processed dados/historico logs .github/cmed
+        run: mkdir -p dados/raw dados/processed/fato logs .github/cmed
 
       - name: Executar ETL CMED
         env:
-          # Só usados se você ativar alertas por e-mail via Secrets.
+          # Só necessários se você ativar alertas por e-mail via Secrets.
           EMAIL_ALERTA_ATIVO: ${{ secrets.EMAIL_ALERTA_ATIVO }}
           SMTP_REMETENTE: ${{ secrets.SMTP_REMETENTE }}
           SMTP_SENHA: ${{ secrets.SMTP_SENHA }}
@@ -56,8 +56,20 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Adiciona apenas o que existe; não quebra se algum caminho faltar.
-          git add dados/ .github/cmed/estado.json 2>/dev/null || true
+          # Versiona apenas os dados processados (Parquet + dimensões) e o estado.
+          # Os .xlsx crus, logs e histórico ficam de fora via .gitignore.
+          git add dados/processed .github/cmed/estado.json 2>/dev/null || true
+
+          # Trava de segurança: aborta se algo com mais de 100 MB entrou no stage.
+          GRANDES=$(git diff --cached --name-only | while read f; do
+            [ -f "$f" ] && sz=$(stat -c%s "$f" 2>/dev/null || echo 0) || sz=0
+            [ "$sz" -gt 104857600 ] && echo "$f ($sz bytes)"
+          done)
+          if [ -n "$GRANDES" ]; then
+            echo "::error::Arquivo(s) acima de 100MB no commit — abortando:"
+            echo "$GRANDES"
+            exit 1
+          fi
 
           if git diff --cached --quiet; then
             echo "Nenhuma alteração para salvar."
