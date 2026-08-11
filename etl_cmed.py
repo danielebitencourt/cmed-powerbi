@@ -269,51 +269,205 @@ def estado_ja_processado(estado: dict, competencia: str, hashes: dict) -> bool:
 # ---------------------------------------------------------------------------
 # EXTRAÇÃO
 # ---------------------------------------------------------------------------
-
 def obter_links_cmed(config: dict) -> dict:
-    url = config["url_cmed"]
-    headers = {"User-Agent": config["user_agent"]}
+    """
+    Acessa a página oficial da CMED/ANVISA e identifica os arquivos
+    XLS/XLSX mais recentes de PMC e PMVG.
 
-    logging.info("Acessando página CMED: %s", url)
-    resp = requests.get(url, headers=headers, timeout=config["timeout_segundos"])
+    A função suporta:
+    - estrutura atual da página (links "PMC - xls" e "PMVG - xls");
+    - estrutura antiga com xls_conformidade_site_* / gov_*;
+    - links absolutos e relativos;
+    - pequenas mudanças no texto dos links.
+    """
+    from urllib.parse import urljoin
+
+    url = config["url_cmed"]
+    timeout = config["timeout_segundos"]
+    headers = {
+        "User-Agent": config["user_agent"],
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;"
+            "q=0.9,image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    }
+
+    logging.info(f"Acessando página CMED: {url}")
+
+    resp = requests.get(
+        url,
+        headers=headers,
+        timeout=timeout,
+        verify=True,
+    )
     resp.raise_for_status()
 
+    logging.info(
+        f"Página CMED acessada com sucesso — HTTP {resp.status_code} "
+        f"({len(resp.content):,} bytes)."
+    )
+
     soup = BeautifulSoup(resp.text, "html.parser")
-    links = {"PMC": None, "PF": None}
+
+    links_encontrados = {
+        "PMC": None,
+        "PF": None,
+    }
+
+    # ============================================================
+    # 1. EXAMINAR TODOS OS LINKS XLS/XLSX
+    # ============================================================
+
+    candidatos = []
 
     for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        texto = a.get_text(strip=True).lower()
+        href_original = str(a.get("href", "")).strip()
+        texto = a.get_text(" ", strip=True)
 
-        if (
-            ("xls_conformidade_site" in href)
-            or ("pmc" in texto and ".xls" in href)
-        ) and href.endswith((".xlsx", ".xls")):
-            links["PMC"] = href if href.startswith("http") else f"https://www.gov.br{href}"
+        if not href_original:
+            continue
 
-        if (
-            ("xls_conformidade_gov" in href)
-            or ("pmvg" in texto and ".xls" in href)
-        ) and href.endswith((".xlsx", ".xls")):
-            links["PF"] = href if href.startswith("http") else f"https://www.gov.br{href}"
+        href_lower = href_original.lower()
+        texto_lower = texto.lower()
 
-    if not links["PMC"] or not links["PF"]:
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
+        # Alguns links podem possuir parâmetros depois da extensão.
+        eh_excel = (
+            ".xls" in href_lower
+            or ".xlsx" in href_lower
+            or "xls" in texto_lower
+        )
 
-            if re.search(r"xls_conformidade_site_\d{8}", href):
-                links["PMC"] = href if href.startswith("http") else f"https://www.gov.br{href}"
+        if not eh_excel:
+            continue
 
-            if re.search(r"xls_conformidade_gov_\d{8}", href):
-                links["PF"] = href if href.startswith("http") else f"https://www.gov.br{href}"
+        href = urljoin(url, href_original)
 
-    for tipo, link in links.items():
+        candidatos.append(
+            {
+                "texto": texto,
+                "href": href,
+                "href_lower": href_lower,
+                "texto_lower": texto_lower,
+            }
+        )
+
+    logging.info(
+        f"Links relacionados a Excel encontrados na página: "
+        f"{len(candidatos)}"
+    )
+
+    for candidato in candidatos:
+        logging.debug(
+            "Candidato XLS: texto='%s' | url='%s'",
+            candidato["texto"],
+            candidato["href"],
+        )
+
+    # ============================================================
+    # 2. IDENTIFICAR PMC
+    # ============================================================
+
+    # Prioridade máxima:
+    # texto do link contendo "PMC" + arquivo XLS/XLSX
+    for candidato in candidatos:
+        texto = candidato["texto_lower"]
+        href = candidato["href_lower"]
+
+        if "pmc" in texto:
+            links_encontrados["PMC"] = candidato["href"]
+            logging.info(
+                f"Link PMC encontrado pelo texto do link: "
+                f"{candidato['href']}"
+            )
+            break
+
+    # Fallback: nomes antigos da CMED
+    if not links_encontrados["PMC"]:
+        for candidato in candidatos:
+            href = candidato["href_lower"]
+
+            if "xls_conformidade_site" in href:
+                links_encontrados["PMC"] = candidato["href"]
+                logging.info(
+                    f"Link PMC encontrado pelo padrão antigo: "
+                    f"{candidato['href']}"
+                )
+                break
+
+    # Fallback adicional: PMC no próprio URL
+    if not links_encontrados["PMC"]:
+        for candidato in candidatos:
+            href = candidato["href_lower"]
+
+            if "pmc" in href:
+                links_encontrados["PMC"] = candidato["href"]
+                logging.info(
+                    f"Link PMC encontrado pelo URL: "
+                    f"{candidato['href']}"
+                )
+                break
+
+    # ============================================================
+    # 3. IDENTIFICAR PMVG / PF
+    # ============================================================
+
+    # A página atual utiliza "PMVG - xls".
+    # Seu ETL chama internamente de PF, portanto mantemos
+    # a chave "PF" para não alterar o restante do código.
+
+    for candidato in candidatos:
+        texto = candidato["texto_lower"]
+
+        if "pmvg" in texto:
+            links_encontrados["PF"] = candidato["href"]
+            logging.info(
+                f"Link PMVG/PF encontrado pelo texto do link: "
+                f"{candidato['href']}"
+            )
+            break
+
+    # Fallback: nomes antigos
+    if not links_encontrados["PF"]:
+        for candidato in candidatos:
+            href = candidato["href_lower"]
+
+            if "xls_conformidade_gov" in href:
+                links_encontrados["PF"] = candidato["href"]
+                logging.info(
+                    f"Link PMVG/PF encontrado pelo padrão antigo: "
+                    f"{candidato['href']}"
+                )
+                break
+
+    # Fallback adicional: PMVG no próprio URL
+    if not links_encontrados["PF"]:
+        for candidato in candidatos:
+            href = candidato["href_lower"]
+
+            if "pmvg" in href:
+                links_encontrados["PF"] = candidato["href"]
+                logging.info(
+                    f"Link PMVG/PF encontrado pelo URL: "
+                    f"{candidato['href']}"
+                )
+                break
+
+    # ============================================================
+    # 4. LOG FINAL
+    # ============================================================
+
+    for tipo, link in links_encontrados.items():
         if link:
-            logging.info("Link %s encontrado: %s", tipo, link)
+            logging.info(
+                f"Link {tipo} encontrado: {link}"
+            )
         else:
-            logging.warning("Link %s NÃO encontrado na página.", tipo)
+            logging.warning(
+                f"Link {tipo} NÃO encontrado na página."
+            )
 
-    return links
+    return links_encontrados
 
 
 def baixar_arquivo_cmed(
