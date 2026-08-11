@@ -4,3 +4,4 @@ requests
 PyYAML
 beautifulsoup4
 openpyxl
+xlrd
