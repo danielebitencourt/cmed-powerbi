@@ -397,6 +397,23 @@ def obter_links_cmed(config: dict) -> dict:
             if links_encontrados["PF"] is None and "gov" in h:
                 links_encontrados["PF"] = absolutizar(href)
 
+    # ── Estratégia 4 (à prova de falhas): regex no HTML BRUTO ──────
+    # O html.parser do Python às vezes descarta o trecho com esses links
+    # (HTML malformado do gov.br). Aqui procuramos direto no texto cru,
+    # sem depender do parser. Os arquivos ficam sempre em .../arquivos/
+    # e começam com xls_conformidade_site_ (PMC) ou xls_conformidade_gov_ (PF).
+    if not links_encontrados["PMC"] or not links_encontrados["PF"]:
+        padrao = re.compile(
+            r'([^\s"\'<>()]*xls_conformidade_(site|gov)_\d{8}[^\s"\'<>()]*)',
+            re.IGNORECASE,
+        )
+        for m in padrao.finditer(resp.text):
+            token, tipo_arq = m.group(1), m.group(2).lower()
+            if tipo_arq == "site" and not links_encontrados["PMC"]:
+                links_encontrados["PMC"] = absolutizar(token)
+            elif tipo_arq == "gov" and not links_encontrados["PF"]:
+                links_encontrados["PF"] = absolutizar(token)
+
     for tipo, link in links_encontrados.items():
         if link:
             logging.info(f"Link {tipo} encontrado: {link}")
