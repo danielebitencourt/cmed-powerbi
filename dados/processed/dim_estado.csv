@@ -1,28 +1,28 @@
 ﻿ESTADO_UF,NOME_ESTADO,REGIAO,ALIQUOTA_ICMS_VIGENTE,ALIQUOTA_ICMS_VIGENTE_PCT
-AC,Acre,Norte,0%,0.0
-AL,Alagoas,Nordeste,17%,0.17
-AM,Amazonas,Norte,0%,0.0
-AP,Amapá,Norte,0%,0.0
-BA,Bahia,Nordeste,17%,0.17
-CE,Ceará,Nordeste,17%,0.17
-DF,Distrito Federal,Centro-Oeste,0%,0.0
-ES,Espírito Santo,Sudeste,12%,0.12
-GO,Goiás,Centro-Oeste,0%,0.0
-MA,Maranhão,Nordeste,17%,0.17
+AC,Acre,Norte,19%,0.19
+AL,Alagoas,Nordeste,20%,0.2
+AM,Amazonas,Norte,20%,0.2
+AP,Amapá,Norte,18%,0.18
+BA,Bahia,Nordeste,"20,5%",0.205
+CE,Ceará,Nordeste,20%,0.2
+DF,Distrito Federal,Centro-Oeste,20%,0.2
+ES,Espírito Santo,Sudeste,17%,0.17
+GO,Goiás,Centro-Oeste,19%,0.19
+MA,Maranhão,Nordeste,23%,0.23
 MG,Minas Gerais,Sudeste,18%,0.18
-MS,Mato Grosso do Sul,Centro-Oeste,0%,0.0
-MT,Mato Grosso,Centro-Oeste,0%,0.0
-PA,Pará,Norte,0%,0.0
-PB,Paraíba,Nordeste,17%,0.17
-PE,Pernambuco,Nordeste,17%,0.17
-PI,Piauí,Nordeste,17%,0.17
-PR,Paraná,Sul,17%,0.17
-RJ,Rio de Janeiro,Sudeste,"17,5%",0.175
-RN,Rio Grande do Norte,Nordeste,17%,0.17
-RO,Rondônia,Norte,0%,0.0
-RR,Roraima,Norte,0%,0.0
-RS,Rio Grande do Sul,Sul,12%,0.12
+MS,Mato Grosso do Sul,Centro-Oeste,17%,0.17
+MT,Mato Grosso,Centro-Oeste,17%,0.17
+PA,Pará,Norte,19%,0.19
+PB,Paraíba,Nordeste,20%,0.2
+PE,Pernambuco,Nordeste,"20,5%",0.205
+PI,Piauí,Nordeste,"22,5%",0.225
+PR,Paraná,Sul,"19,5%",0.195
+RJ,Rio de Janeiro,Sudeste,22%,0.22
+RN,Rio Grande do Norte,Nordeste,20%,0.2
+RO,Rondônia,Norte,"19,5%",0.195
+RR,Roraima,Norte,20%,0.2
+RS,Rio Grande do Sul,Sul,17%,0.17
 SC,Santa Catarina,Sul,17%,0.17
-SE,Sergipe,Nordeste,17%,0.17
-SP,São Paulo,Sudeste,17%,0.17
-TO,Tocantins,Norte,0%,0.0
+SE,Sergipe,Nordeste,20%,0.2
+SP,São Paulo,Sudeste,18%,0.18
+TO,Tocantins,Norte,20%,0.2
