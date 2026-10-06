@@ -74,18 +74,56 @@ CONFIG_PADRAO = {
 # MAPEAMENTO ICMS → UF  (Resolução CM-CMED nº 2/2024 + atualizações)
 # ═══════════════════════════════════════════════════════════════════════
 
-MAPEAMENTO_ICMS_UF = {
-    "0%":    ["AC", "AM", "AP", "PA", "RO", "RR", "TO", "MT", "MS", "GO", "DF"],
-    "12%":   ["ES", "RS"],
-    "17%":   ["AL", "BA", "CE", "MA", "PB", "PE", "PI", "RN", "SE", "PR", "SC", "SP"],
-    "17,5%": ["RJ"],
-    "18%":   ["MG"],
-    "19,5%": [],  # Preencher conforme legislação vigente no momento da carga
-    "20%":   [],
-    "20,5%": [],
-    "21%":   [],
-    "22%":   [],
-}
+# Mapeamento UF -> alíquota de ICMS.
+# A FONTE DA VERDADE é o arquivo versionado 'aliquotas_icms.csv' (ao lado
+# deste script). Atualizar alíquota = editar o CSV e abrir PR no GitHub —
+# com histórico, data de vigência e fonte. Não se mexe mais no código.
+# A coluna "0%" é só para medicamentos ISENTOS (CONFAZ), não é alíquota de
+# estado, então nenhuma UF é mapeada para 0%.
+def _carregar_mapeamento_icms(caminho=None, ref: str = None) -> dict:
+    """
+    Lê aliquotas_icms.csv e retorna {alíquota: [UFs]} vigente na data 'ref'
+    (padrão: hoje). Para cada UF escolhe a linha com VIGENCIA_INICIO mais
+    recente que seja <= ref. Se o arquivo faltar ou falhar, cai num default
+    interno (com aviso no log) para o ETL nunca quebrar por causa disso.
+    """
+    from datetime import date
+    ref_d = date.fromisoformat(ref) if ref else date.today()
+    caminho = Path(caminho) if caminho else Path(__file__).with_name("aliquotas_icms.csv")
+
+    _DEFAULT = {
+        "17%": ["DF", "ES", "MS", "MT", "RS", "SC"], "18%": ["AP", "MG", "SP"],
+        "19%": ["AC", "GO", "PA", "SE"], "19,5%": ["PR", "RO"],
+        "20%": ["AL", "AM", "CE", "PB", "RN", "RR", "TO"],
+        "20,5%": ["BA", "PE"], "22%": ["RJ"], "22,5%": ["PI"], "23%": ["MA"],
+    }
+    if not caminho.exists():
+        logging.warning(f"{caminho.name} não encontrado; usando mapeamento ICMS interno.")
+        return _DEFAULT
+    try:
+        df = pd.read_csv(caminho, dtype=str, encoding="utf-8-sig").fillna("")
+        df.columns = [c.strip().lstrip("\ufeff").upper() for c in df.columns]
+        escolha = {}  # UF -> (vigencia, alíquota)
+        for _, r in df.iterrows():
+            uf = str(r["UF"]).strip().upper()
+            aliq = str(r["ALIQUOTA_ICMS"]).strip()
+            vi = str(r.get("VIGENCIA_INICIO", "")).strip()
+            vi_d = date.fromisoformat(vi) if vi else date.min
+            if uf and aliq and vi_d <= ref_d and (uf not in escolha or vi_d >= escolha[uf][0]):
+                escolha[uf] = (vi_d, aliq)
+        mapa = {}
+        for uf, (_, aliq) in escolha.items():
+            mapa.setdefault(aliq, []).append(uf)
+        if not mapa:
+            raise ValueError("mapeamento vazio após leitura")
+        logging.info(f"Mapeamento ICMS carregado de {caminho.name}: {len(escolha)} UFs.")
+        return mapa
+    except Exception as e:
+        logging.error(f"Falha ao ler {caminho.name} ({e}); usando mapeamento ICMS interno.")
+        return _DEFAULT
+
+
+MAPEAMENTO_ICMS_UF = _carregar_mapeamento_icms()
 
 # Colunas de preço esperadas no arquivo PMC/PF
 # A CMED pode alterar a quantidade de alíquotas e inserir espaços antes do "%".
