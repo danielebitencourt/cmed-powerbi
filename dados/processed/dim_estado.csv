@@ -5,7 +5,7 @@ AM,Amazonas,Norte,20%,0.2
 AP,Amapá,Norte,18%,0.18
 BA,Bahia,Nordeste,"20,5%",0.205
 CE,Ceará,Nordeste,20%,0.2
-DF,Distrito Federal,Centro-Oeste,20%,0.2
+DF,Distrito Federal,Centro-Oeste,17%,0.17
 ES,Espírito Santo,Sudeste,17%,0.17
 GO,Goiás,Centro-Oeste,19%,0.19
 MA,Maranhão,Nordeste,23%,0.23
@@ -23,6 +23,6 @@ RO,Rondônia,Norte,"19,5%",0.195
 RR,Roraima,Norte,20%,0.2
 RS,Rio Grande do Sul,Sul,17%,0.17
 SC,Santa Catarina,Sul,17%,0.17
-SE,Sergipe,Nordeste,20%,0.2
+SE,Sergipe,Nordeste,19%,0.19
 SP,São Paulo,Sudeste,18%,0.18
 TO,Tocantins,Norte,20%,0.2
