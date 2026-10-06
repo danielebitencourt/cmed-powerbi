@@ -1,9 +1,12 @@
-# ETL CMED → Power BI
-# Instalar: pip install -r requirements.txt
-
-requests>=2.31.0
-beautifulsoup4>=4.12.0
-pandas>=2.1.0
-numpy>=1.24.0
-openpyxl>=3.1.0
-pyyaml>=6.0
+# Versões fixadas para builds reproduzíveis no GitHub Actions.
+# Sem fixar, o CI instala sempre a versão mais nova e pode quebrar por
+# incompatibilidade (ex.: numpy 2.x com pandas antigo) — algo que não
+# acontece localmente porque sua máquina já tem versões em cache.
+numpy==1.26.4
+pandas==2.2.2
+requests==2.32.3
+PyYAML==6.0.2
+beautifulsoup4==4.12.3
+openpyxl==3.1.5
+xlrd==2.0.1
+pyarrow==17.0.0

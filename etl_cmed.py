@@ -18,9 +18,12 @@ Licença: Uso interno
 
 import argparse
 import hashlib
+import json
 import logging
+import os
 import re
 import smtplib
+import socket
 import sys
 import time
 from datetime import datetime
@@ -28,6 +31,7 @@ from email.mime.text import MIMEText
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urljoin
 
 import numpy as np
 import pandas as pd
@@ -45,9 +49,11 @@ CONFIG_PADRAO = {
     "diretorio_raw": "dados/raw",
     "diretorio_historico": "dados/historico",
     "diretorio_log": "logs",
+    "arquivo_estado": ".github/cmed/estado.json",
     "timeout_segundos": 90,
     "tentativas_max": 3,
     "intervalo_retry_segundos": 30,
+    "forcar_ipv4": True,
     "user_agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -159,6 +165,21 @@ def carregar_config(caminho_config: Optional[str] = None) -> dict:
             if custom:
                 config.update(custom)
         logging.info(f"Configuração carregada de: {caminho_config}")
+
+    # Segurança: credenciais NUNCA devem ficar no repositório.
+    # Elas são lidas de variáveis de ambiente (GitHub Secrets) quando existirem.
+    cfg_email = config.setdefault("email_alerta", {})
+    if os.getenv("SMTP_REMETENTE"):
+        cfg_email["remetente"] = os.environ["SMTP_REMETENTE"]
+    if os.getenv("SMTP_SENHA"):
+        cfg_email["senha"] = os.environ["SMTP_SENHA"]
+    if os.getenv("SMTP_DESTINATARIOS"):
+        cfg_email["destinatarios"] = [
+            e.strip() for e in os.environ["SMTP_DESTINATARIOS"].split(",") if e.strip()
+        ]
+    if os.getenv("EMAIL_ALERTA_ATIVO"):
+        cfg_email["ativo"] = os.environ["EMAIL_ALERTA_ATIVO"].lower() in ("1", "true", "sim")
+
     return config
 
 
@@ -223,6 +244,113 @@ def calcular_hash_arquivo(caminho: Path) -> str:
     return sha.hexdigest()
 
 
+def forcar_ipv4() -> None:
+    """
+    Força todas as conexões HTTP a usarem IPv4.
+
+    No GitHub Actions o runner normalmente NÃO tem rota IPv6 de saída. Como o
+    gov.br publica endereço IPv6 (registro AAAA), o requests pode tentar IPv6
+    e falhar com '[Errno 101] Network is unreachable'. Localmente isso não
+    ocorre. Restringir a resolução de nomes a IPv4 resolve o problema.
+    """
+    # Caminho 1 (preferido): urllib3 respeita allowed_gai_family.
+    try:
+        import urllib3.util.connection as urllib3_cn
+
+        def _somente_ipv4():
+            return socket.AF_INET
+
+        urllib3_cn.allowed_gai_family = _somente_ipv4
+    except Exception as e:  # pragma: no cover
+        logging.debug(f"Não foi possível ajustar urllib3 para IPv4: {e}")
+
+    # Caminho 2 (reforço): filtra getaddrinfo para AF_INET no processo todo.
+    _orig_getaddrinfo = socket.getaddrinfo
+
+    def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+        resultados = _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+        return resultados or _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+    socket.getaddrinfo = _getaddrinfo_ipv4
+    logging.info("Rede: conexões restritas a IPv4 (evita ENETUNREACH no CI).")
+
+
+def criar_sessao_http(config: dict) -> requests.Session:
+    """
+    Cria uma sessão HTTP com retry automático a nível de conexão.
+
+    Isto é essencial no GitHub Actions: os runners rodam em datacenter
+    (Azure) e o gov.br frequentemente responde com 403/429/503 ou derruba
+    a conexão. O retry com backoff recupera falhas transitórias que não
+    acontecem na sua máquina local.
+    """
+    from requests.adapters import HTTPAdapter
+
+    if config.get("forcar_ipv4", True):
+        forcar_ipv4()
+
+    try:
+        from urllib3.util.retry import Retry
+    except ImportError:  # urllib3 < 1.26
+        from requests.packages.urllib3.util.retry import Retry  # type: ignore
+
+    sessao = requests.Session()
+    retry = Retry(
+        total=config.get("tentativas_max", 3),
+        connect=config.get("tentativas_max", 3),
+        read=config.get("tentativas_max", 3),
+        backoff_factor=2,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    sessao.mount("https://", adapter)
+    sessao.mount("http://", adapter)
+
+    # Cabeçalhos "de navegador" reduzem bloqueios do WAF do gov.br.
+    # NÃO forçamos Accept-Encoding: deixamos o requests anunciar apenas os
+    # formatos que sabe descomprimir (gzip/deflate). Forçar "br" (brotli)
+    # sem a lib instalada faz o corpo chegar ilegível e nenhum link é achado.
+    sessao.headers.update({
+        "User-Agent": config["user_agent"],
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,"
+            "application/vnd.ms-excel,*/*;q=0.8"
+        ),
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    })
+    return sessao
+
+
+def carregar_estado(config: dict) -> dict:
+    """Lê o arquivo de estado (última competência processada)."""
+    caminho = Path(config.get("arquivo_estado", ".github/cmed/estado.json"))
+    if caminho.exists():
+        try:
+            return json.loads(caminho.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            logging.warning(f"Estado ilegível ({e}). Iniciando estado vazio.")
+    return {}
+
+
+def salvar_estado(config: dict, estado: dict) -> None:
+    """
+    Grava o arquivo de estado. Isto também garante que o caminho exista
+    para o `git add .github/cmed/estado.json` do workflow não falhar.
+    """
+    caminho = Path(config.get("arquivo_estado", ".github/cmed/estado.json"))
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    caminho.write_text(
+        json.dumps(estado, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logging.info(f"Estado salvo: {caminho}")
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 1. EXTRAÇÃO — Download dos arquivos CMED
 # ═══════════════════════════════════════════════════════════════════════
@@ -235,53 +363,135 @@ def obter_links_cmed(config: dict) -> dict:
     """
     url = config["url_cmed"]
     timeout = config["timeout_segundos"]
-    headers = {"User-Agent": config["user_agent"]}
+    sessao = config.get("_sessao") or criar_sessao_http(config)
 
     logging.info(f"Acessando página CMED: {url}")
-    resp = requests.get(url, headers=headers, timeout=timeout, verify=True)
+    resp = sessao.get(url, timeout=(20, timeout), verify=True)
+    if resp.status_code != 200:
+        # Diagnóstico: no CI, gov.br costuma devolver 403 (bloqueio de WAF/IP
+        # de datacenter). O trecho abaixo ajuda a distinguir bloqueio de bug.
+        amostra = resp.text[:500].replace("\n", " ")
+        logging.error(
+            f"Página CMED respondeu HTTP {resp.status_code}. "
+            f"Início da resposta: {amostra!r}"
+        )
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
+    def desescapar(s: str) -> str:
+        # Links vindos de blocos JSON/JS trazem barras escapadas: \u002F, \/ etc.
+        s = s.replace("\\/", "/")
+        s = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
+        return s.strip()
+
+    def absolutizar(href: str) -> str:
+        href = desescapar(href)
+        if href.startswith("http"):
+            return href
+        if href.startswith("//"):
+            return "https:" + href
+        if href.startswith("/"):
+            return "https://www.gov.br" + href
+        return urljoin(url.rstrip("/") + "/", href)
+
     links_encontrados = {"PMC": None, "PF": None}
 
-    # Procurar todos os links na página
+    def texto_link(a) -> str:
+        t = a.get_text(" ", strip=True).lower()
+        return re.sub(r"\s+", " ", t)
+
+    # ── Estratégia 1: identificar pelo TEXTO do link (mais robusta) ──
+    # A página lista âncoras que começam com "PMC - xls ..." e "PMVG - xls ...".
+    # Isso independe do formato da URL, que pode vir como:
+    #   .../xls_conformidade_site_AAAAMMDD_xxxx.xlsx/@@download/file
+    #   .../resolveuid/<uuid>            (o Plone às vezes entrega assim)
+    #   .../xls_conformidade_site_...xlsx  (URL direta — ambiente local)
     for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        texto = a.get_text(strip=True).lower()
+        inicio = texto_link(a)[:30]
+        href = a["href"]
+        eh_xls = ("xls" in inicio) or href.lower().endswith((".xlsx", ".xls"))
+        if not eh_xls:
+            continue
+        if links_encontrados["PMC"] is None and re.search(r"\bpmc\b", inicio):
+            links_encontrados["PMC"] = absolutizar(href)
+        elif links_encontrados["PF"] is None and re.search(r"\bpmvg\b", inicio):
+            links_encontrados["PF"] = absolutizar(href)
 
-        # PMC — arquivo "site" (xls_conformidade_site_*)
-        if "xls_conformidade_site" in href or "pmc" in texto and ".xls" in href:
-            if href.endswith((".xlsx", ".xls")):
-                links_encontrados["PMC"] = href if href.startswith("http") else (
-                    f"https://www.gov.br{href}"
-                )
-
-        # PF/PMVG — arquivo "gov" (xls_conformidade_gov_*)
-        if "xls_conformidade_gov" in href or "pmvg" in texto and ".xls" in href:
-            if href.endswith((".xlsx", ".xls")):
-                links_encontrados["PF"] = href if href.startswith("http") else (
-                    f"https://www.gov.br{href}"
-                )
-
-    # Fallback: procurar links que contenham padrão de data no nome
+    # ── Estratégia 2 (fallback): padrão do nome do arquivo no href ──
     if not links_encontrados["PMC"] or not links_encontrados["PF"]:
         for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if re.search(r"xls_conformidade_site_\d{8}", href):
-                links_encontrados["PMC"] = href if href.startswith("http") else (
-                    f"https://www.gov.br{href}"
-                )
-            if re.search(r"xls_conformidade_gov_\d{8}", href):
-                links_encontrados["PF"] = href if href.startswith("http") else (
-                    f"https://www.gov.br{href}"
-                )
+            href = a["href"]
+            if links_encontrados["PMC"] is None and re.search(r"xls_conformidade_site", href, re.I):
+                links_encontrados["PMC"] = absolutizar(href)
+            if links_encontrados["PF"] is None and re.search(r"xls_conformidade_gov", href, re.I):
+                links_encontrados["PF"] = absolutizar(href)
+
+    # ── Estratégia 3 (fallback amplo): qualquer .xls* com "conformidade" ──
+    if not links_encontrados["PMC"] or not links_encontrados["PF"]:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            h = href.lower()
+            if "conformidade" not in h or (".xls" not in h):
+                continue
+            if links_encontrados["PMC"] is None and "site" in h:
+                links_encontrados["PMC"] = absolutizar(href)
+            if links_encontrados["PF"] is None and "gov" in h:
+                links_encontrados["PF"] = absolutizar(href)
+
+    # ── Estratégia 4 (à prova de falhas): regex no HTML BRUTO ──────
+    # O html.parser do Python às vezes descarta o trecho com esses links
+    # (HTML malformado do gov.br). Aqui procuramos direto no texto cru,
+    # sem depender do parser. Os arquivos ficam sempre em .../arquivos/
+    # e começam com xls_conformidade_site_ (PMC) ou xls_conformidade_gov_ (PF).
+    if not links_encontrados["PMC"] or not links_encontrados["PF"]:
+        padrao = re.compile(
+            r'([^\s"\'<>()]*xls_conformidade_(site|gov)_\d{8}[^\s"\'<>()]*)',
+            re.IGNORECASE,
+        )
+        for m in padrao.finditer(resp.text):
+            token, tipo_arq = m.group(1), m.group(2).lower()
+            if tipo_arq == "site" and not links_encontrados["PMC"]:
+                links_encontrados["PMC"] = absolutizar(token)
+            elif tipo_arq == "gov" and not links_encontrados["PF"]:
+                links_encontrados["PF"] = absolutizar(token)
 
     for tipo, link in links_encontrados.items():
         if link:
             logging.info(f"Link {tipo} encontrado: {link}")
         else:
             logging.warning(f"Link {tipo} NÃO encontrado na página.")
+
+    # Diagnóstico quando algo falta.
+    if not links_encontrados["PMC"] or not links_encontrados["PF"]:
+        total_links = len(soup.find_all("a", href=True))
+        tem_conformidade = "conformidade" in resp.text.lower()
+        logging.error(
+            f"Diagnóstico: {total_links} links na página | "
+            f"'conformidade' presente no HTML: {tem_conformidade} | "
+            f"tamanho do HTML: {len(resp.text)} bytes. "
+            "Se 'conformidade' for False, provavelmente é página de bloqueio/anti-bot."
+        )
+        # Amostra dos links que mencionam xls/pmc/pmvg/conformidade — mostra o
+        # formato REAL de href recebido, para ajustar a regra se necessário.
+        amostras = []
+        for a in soup.find_all("a", href=True):
+            t = texto_link(a)[:40]
+            h = a["href"]
+            if any(k in (t + " " + h.lower()) for k in ("xls", "pmc", "pmvg", "conformidade")):
+                amostras.append(f"  texto={t!r} href={h[:160]!r}")
+            if len(amostras) >= 15:
+                break
+        if amostras:
+            logging.error("Amostra de links candidatos:\n" + "\n".join(amostras))
+        try:
+            dir_log = Path(config.get("diretorio_log", "logs"))
+            dir_log.mkdir(parents=True, exist_ok=True)
+            debug_path = dir_log / "cmed_pagina_debug.html"
+            debug_path.write_text(resp.text, encoding="utf-8")
+            logging.error(f"HTML da resposta salvo em: {debug_path}")
+        except OSError as e:
+            logging.warning(f"Não foi possível salvar HTML de depuração: {e}")
 
     return links_encontrados
 
@@ -299,34 +509,55 @@ def baixar_arquivo_cmed(
     tentativas = config["tentativas_max"]
     intervalo = config["intervalo_retry_segundos"]
     timeout = config["timeout_segundos"]
-    headers = {"User-Agent": config["user_agent"]}
+    sessao = config.get("_sessao") or criar_sessao_http(config)
+    headers = {"Referer": config["url_cmed"]}
 
-    # Extrair competência do nome do arquivo (YYYYMMDD)
-    match_data = re.search(r"(\d{8})", url)
-    if match_data and not competencia:
-        data_str = match_data.group(1)
-        competencia = f"{data_str[:4]}-{data_str[4:6]}"
+    competencia_forcada = competencia
 
-    if not competencia:
-        competencia = datetime.now().strftime("%Y-%m")
-
-    # Diretório de destino
-    dir_raw = Path(config["diretorio_raw"]) / competencia
-    dir_raw.mkdir(parents=True, exist_ok=True)
-
-    # Nome do arquivo local
-    nome_arquivo = url.split("/")[-1]
-    if not nome_arquivo.endswith((".xlsx", ".xls")):
-        nome_arquivo = f"cmed_{tipo.lower()}_{competencia}.xlsx"
-    caminho_local = dir_raw / nome_arquivo
+    def _competencia_de(texto: Optional[str]) -> Optional[str]:
+        if not texto:
+            return None
+        m = re.search(r"(20\d{2})(0[1-9]|1[0-2])\d{2}", texto)  # AAAAMMDD
+        if m:
+            return f"{m.group(1)}-{m.group(2)}"
+        m = re.search(r"(20\d{2})-(0[1-9]|1[0-2])", texto)      # AAAA-MM
+        if m:
+            return f"{m.group(1)}-{m.group(2)}"
+        return None
 
     for tentativa in range(1, tentativas + 1):
         try:
             logging.info(
                 f"Download {tipo} — tentativa {tentativa}/{tentativas}: {url}"
             )
-            resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
+            resp = sessao.get(url, headers=headers, timeout=(20, timeout), stream=True)
             resp.raise_for_status()
+
+            # A URL de origem pode ser "resolveuid/<uuid>" (sem data). Descobrimos
+            # o nome/competência reais pelo Content-Disposition ou pela URL final
+            # após os redirecionamentos que o Plone faz.
+            content_disp = resp.headers.get("Content-Disposition", "")
+            nome_cd = None
+            m_cd = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^\";]+)"?', content_disp, re.I)
+            if m_cd:
+                nome_cd = m_cd.group(1)
+
+            competencia = (
+                competencia_forcada
+                or _competencia_de(nome_cd)
+                or _competencia_de(str(resp.url))
+                or _competencia_de(url)
+                or datetime.now().strftime("%Y-%m")
+            )
+
+            # Nome do arquivo local: prioriza Content-Disposition, depois URL final.
+            nome_arquivo = nome_cd or str(resp.url).split("/")[-1].split("?")[0]
+            if not nome_arquivo.lower().endswith((".xlsx", ".xls")):
+                nome_arquivo = f"cmed_{tipo.lower()}_{competencia}.xlsx"
+
+            dir_raw = Path(config["diretorio_raw"]) / competencia
+            dir_raw.mkdir(parents=True, exist_ok=True)
+            caminho_local = dir_raw / nome_arquivo
 
             with open(caminho_local, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=8192):
@@ -338,10 +569,21 @@ def baixar_arquivo_cmed(
                     f"Arquivo muito pequeno ({tamanho} bytes) — possível erro de download."
                 )
 
+            # Validação leve: XLSX é um ZIP (assinatura "PK"); XLS antigo começa
+            # com D0 CF 11 E0. Se vier HTML, é página de erro disfarçada.
+            with open(caminho_local, "rb") as fh:
+                assinatura = fh.read(4)
+            if assinatura[:2] not in (b"PK", b"\xd0\xcf"):
+                raise ValueError(
+                    "Conteúdo baixado não é um Excel válido (possível página de "
+                    f"erro). Primeiros bytes: {assinatura!r}"
+                )
+
             sha = calcular_hash_arquivo(caminho_local)
             logging.info(
                 f"Download {tipo} concluído: {caminho_local} "
-                f"({tamanho:,} bytes, SHA-256: {sha[:16]}...)"
+                f"({tamanho:,} bytes, competência {competencia}, "
+                f"SHA-256: {sha[:16]}...)"
             )
             return caminho_local
 
@@ -522,14 +764,23 @@ def normalizar_nomes_colunas(colunas: list) -> list:
     return resultado
 
 
+def _selecionar_engine(caminho: Path) -> str:
+    """Escolhe o engine do pandas conforme a extensão do arquivo."""
+    sufixo = caminho.suffix.lower()
+    if sufixo == ".xls":
+        return "xlrd"       # formato antigo (BIFF)
+    return "openpyxl"       # .xlsx / .xlsm
+
+
 def ler_arquivo_cmed(caminho: Path) -> pd.DataFrame:
     """Lê arquivo CMED, encontra o cabeçalho dinamicamente e valida a estrutura."""
     logging.info(f"Lendo arquivo: {caminho}")
 
-    df_raw = pd.read_excel(caminho, header=None, dtype=str, engine="openpyxl")
+    engine = _selecionar_engine(caminho)
+    df_raw = pd.read_excel(caminho, header=None, dtype=str, engine=engine)
     idx_header = detectar_linha_cabecalho(df_raw)
 
-    df = pd.read_excel(caminho, header=idx_header, dtype=str, engine="openpyxl")
+    df = pd.read_excel(caminho, header=idx_header, dtype=str, engine=engine)
     df.columns = normalizar_nomes_colunas(list(df.columns))
     df.dropna(how="all", inplace=True)
 
@@ -747,11 +998,17 @@ def gerar_dimensao_calendario(
     data_fim: str = "2027-12-31",
 ) -> pd.DataFrame:
     """Gera tabela dimensão dCalendario."""
+    meses_pt = {
+        1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
+        5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto",
+        9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro",
+    }
     datas = pd.date_range(start=data_inicio, end=data_fim, freq="D")
     df = pd.DataFrame({"DATA": datas})
     df["ANO"] = df["DATA"].dt.year
     df["MES"] = df["DATA"].dt.month
-    df["NOME_MES"] = df["DATA"].dt.strftime("%B").str.capitalize()
+    # Não usar strftime("%B"): depende do locale do SO (sai em inglês no CI).
+    df["NOME_MES"] = df["MES"].map(meses_pt)
     df["TRIMESTRE"] = df["DATA"].dt.quarter
     df["COMPETENCIA"] = df["DATA"].dt.strftime("%Y-%m")
     df["DATA"] = df["DATA"].dt.strftime("%Y-%m-%d")
@@ -772,52 +1029,46 @@ def exportar_para_powerbi(
     modo_historico: bool = True,
 ) -> dict:
     """
-    Exporta DataFrames para CSV (utf-8-sig) prontos para o Power BI.
-    Se modo_historico=True, faz append à tabela fato existente.
+    Exporta dados prontos para o Power BI.
+
+    A tabela FATO é gravada em Parquet PARTICIONADO POR COMPETÊNCIA
+    (um arquivo por mês em dados/processed/fato/). Motivos:
+      • Parquet comprime muito dados repetitivos (377 MB de CSV ≈ 20-40 MB),
+        ficando bem abaixo do limite de 100 MB por arquivo do GitHub.
+      • Particionar por mês evita um arquivo único que cresce sem parar.
+      • O Power BI lê uma pasta de Parquet nativamente ("Pasta" → Combinar).
+    As DIMENSÕES continuam em CSV (são pequenas) e são acumuladas/dedupadas.
     """
     dir_saida = Path(diretorio)
     dir_saida.mkdir(parents=True, exist_ok=True)
-
     encoding = "utf-8-sig"  # compatível com Excel e Power BI
     arquivos = {}
 
-    # ── Fato: append (histórico) ───────────────────────────────────
-    caminho_fato = dir_saida / "fato_precos.csv"
-    if modo_historico and caminho_fato.exists():
-        df_existente = pd.read_csv(caminho_fato, dtype=str, encoding=encoding)
-        # Evitar duplicatas pela combinação EAN+UF+TIPO+COMPETENCIA+ALIQUOTA
-        chave = ["EAN", "ESTADO_UF", "TIPO_PRECO", "COMPETENCIA", "ALIQUOTA_ICMS"]
-        chaves_existentes = set(
-            df_existente[chave].apply(lambda r: "|".join(str(v) for v in r), axis=1)
-        )
-        mask_novos = df_fato[chave].apply(
-            lambda r: "|".join(str(v) for v in r), axis=1
-        ).apply(lambda x: x not in chaves_existentes)
-        df_novos = df_fato[mask_novos]
-        if len(df_novos) > 0:
-            df_final = pd.concat([df_existente, df_novos], ignore_index=True)
-            logging.info(
-                f"Histórico: {len(df_novos)} registros novos adicionados "
-                f"(total: {len(df_final)})."
-            )
-        else:
-            df_final = df_existente
-            logging.info("Nenhum registro novo — dados já existem no histórico.")
+    # ── FATO: Parquet, um arquivo por competência ──────────────────
+    dir_fato = dir_saida / "fato"
+    dir_fato.mkdir(parents=True, exist_ok=True)
+
+    if "COMPETENCIA" in df_fato.columns and len(df_fato) > 0:
+        competencias = sorted(df_fato["COMPETENCIA"].dropna().unique())
     else:
-        df_final = df_fato
+        competencias = []
 
-    df_final.to_csv(caminho_fato, index=False, encoding=encoding)
-    arquivos["fato_precos"] = caminho_fato
+    for comp in competencias:
+        parte = df_fato[df_fato["COMPETENCIA"] == comp]
+        caminho_parte = dir_fato / f"fato_precos_{comp}.parquet"
+        # Sobrescreve o mês (idempotente entre as execuções do mesmo mês).
+        parte.to_parquet(caminho_parte, index=False, engine="pyarrow", compression="snappy")
+        arquivos[f"fato_precos_{comp}"] = caminho_parte
 
-    # ── Dimensões (sobrescrever — são estáticas/acumulativas) ──────
+    if not competencias:
+        logging.warning("Tabela fato vazia — nenhum Parquet gerado.")
+
+    # ── Dimensões (CSV, acumuladas/dedupadas) ──────────────────────
     caminho_med = dir_saida / "dim_medicamento.csv"
     if caminho_med.exists():
         df_med_existente = pd.read_csv(caminho_med, dtype=str, encoding=encoding)
-        df_medicamento = pd.concat(
-            [df_med_existente, df_medicamento], ignore_index=True
-        )
+        df_medicamento = pd.concat([df_med_existente, df_medicamento], ignore_index=True)
         df_medicamento.drop_duplicates(subset=["EAN"], keep="last", inplace=True)
-
     df_medicamento.to_csv(caminho_med, index=False, encoding=encoding)
     arquivos["dim_medicamento"] = caminho_med
 
@@ -831,7 +1082,8 @@ def exportar_para_powerbi(
 
     for nome, caminho in arquivos.items():
         tam = Path(caminho).stat().st_size
-        logging.info(f"Exportado: {caminho} ({tam:,} bytes)")
+        aviso = "  ⚠ ACIMA DE 100MB!" if tam > 100 * 1024 * 1024 else ""
+        logging.info(f"Exportado: {caminho} ({tam:,} bytes){aviso}")
 
     return arquivos
 
@@ -850,6 +1102,10 @@ def main():
 
     config = carregar_config(args.config)
     configurar_log(config)
+
+    # Sessão HTTP única e resiliente, reaproveitada em todos os downloads.
+    config["_sessao"] = criar_sessao_http(config)
+    estado = carregar_estado(config)
 
     inicio = datetime.now()
     logging.info("=" * 70)
@@ -896,15 +1152,15 @@ def main():
             config["diretorio_saida"],
         )
 
-        # 8. Backup histórico
-        dir_hist = Path(config["diretorio_historico"])
-        dir_hist.mkdir(parents=True, exist_ok=True)
         competencia = extrair_competencia_do_arquivo(arquivo_pmc)
-        for nome, caminho in arquivos.items():
-            backup = dir_hist / f"{nome}_{competencia}.csv"
-            import shutil
-            shutil.copy2(caminho, backup)
-            logging.info(f"Backup: {backup}")
+
+        # 8. Registrar estado (última execução bem-sucedida).
+        estado.update({
+            "ultima_competencia": competencia,
+            "ultima_execucao": datetime.now().isoformat(),
+            "registros_fato": int(len(df_fato)),
+        })
+        salvar_estado(config, estado)
 
         fim = datetime.now()
         duracao = (fim - inicio).total_seconds()
