@@ -422,9 +422,11 @@ def obter_links_cmed(config: dict) -> dict:
     if not links_encontrados["PMC"] or not links_encontrados["PF"]:
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            if links_encontrados["PMC"] is None and re.search(r"xls_conformidade_site", href, re.I):
+            # Nomes atuais da ANVISA: lista_pmc_ / lista_pmvg_
+            # Nomes antigos (compat.): xls_conformidade_site_ / _gov_
+            if links_encontrados["PMC"] is None and re.search(r"lista_pmc|xls_conformidade_site", href, re.I):
                 links_encontrados["PMC"] = absolutizar(href)
-            if links_encontrados["PF"] is None and re.search(r"xls_conformidade_gov", href, re.I):
+            if links_encontrados["PF"] is None and re.search(r"lista_pmvg|xls_conformidade_gov", href, re.I):
                 links_encontrados["PF"] = absolutizar(href)
 
     # ── Estratégia 3 (fallback amplo): qualquer .xls* com "conformidade" ──
@@ -432,11 +434,11 @@ def obter_links_cmed(config: dict) -> dict:
         for a in soup.find_all("a", href=True):
             href = a["href"]
             h = href.lower()
-            if "conformidade" not in h or (".xls" not in h):
+            if ".xls" not in h:
                 continue
-            if links_encontrados["PMC"] is None and "site" in h:
+            if links_encontrados["PMC"] is None and ("lista_pmc" in h or ("conformidade" in h and "site" in h)):
                 links_encontrados["PMC"] = absolutizar(href)
-            if links_encontrados["PF"] is None and "gov" in h:
+            if links_encontrados["PF"] is None and ("lista_pmvg" in h or ("conformidade" in h and "gov" in h)):
                 links_encontrados["PF"] = absolutizar(href)
 
     # ── Estratégia 4 (à prova de falhas): regex no HTML BRUTO ──────
@@ -446,14 +448,15 @@ def obter_links_cmed(config: dict) -> dict:
     # e começam com xls_conformidade_site_ (PMC) ou xls_conformidade_gov_ (PF).
     if not links_encontrados["PMC"] or not links_encontrados["PF"]:
         padrao = re.compile(
-            r'([^\s"\'<>()]*xls_conformidade_(site|gov)_\d{8}[^\s"\'<>()]*)',
+            r'([^\s"\'<>()]*(?:lista_(pmc|pmvg)|xls_conformidade_(site|gov))_\d{8}[^\s"\'<>()]*)',
             re.IGNORECASE,
         )
         for m in padrao.finditer(resp.text):
-            token, tipo_arq = m.group(1), m.group(2).lower()
-            if tipo_arq == "site" and not links_encontrados["PMC"]:
+            token = m.group(1)
+            nome = (m.group(2) or m.group(3) or "").lower()
+            if nome in ("pmc", "site") and not links_encontrados["PMC"]:
                 links_encontrados["PMC"] = absolutizar(token)
-            elif tipo_arq == "gov" and not links_encontrados["PF"]:
+            elif nome in ("pmvg", "gov") and not links_encontrados["PF"]:
                 links_encontrados["PF"] = absolutizar(token)
 
     for tipo, link in links_encontrados.items():
@@ -465,7 +468,7 @@ def obter_links_cmed(config: dict) -> dict:
     # Diagnóstico quando algo falta.
     if not links_encontrados["PMC"] or not links_encontrados["PF"]:
         total_links = len(soup.find_all("a", href=True))
-        tem_conformidade = "conformidade" in resp.text.lower()
+        tem_conformidade = any(k in resp.text.lower() for k in ("conformidade", "lista_pmc", "lista_pmvg"))
         logging.error(
             f"Diagnóstico: {total_links} links na página | "
             f"'conformidade' presente no HTML: {tem_conformidade} | "
@@ -948,10 +951,21 @@ def gerar_dimensao_medicamento(df_raw: pd.DataFrame) -> pd.DataFrame:
         "TIPO DE PRODUTO (STATUS DO PRODUTO)": "TIPO_PRODUTO",
     }
 
-    # Selecionar colunas presentes
-    cols_presentes = {k: v for k, v in cols_dim.items() if k in df_raw.columns}
-    df_dim = df_raw[list(cols_presentes.keys())].copy()
-    df_dim.rename(columns=cols_presentes, inplace=True)
+    # Colunas de atributo (todas menos as de EAN) presentes no arquivo
+    attr_map = {k: v for k, v in cols_dim.items()
+                if k != "EAN 1" and k in df_raw.columns}
+
+    # Empilhar EAN 1/2/3 numa única coluna EAN. O fato explode os três
+    # códigos de barras; se a dimensão usar só "EAN 1", ~4,5% das linhas do
+    # fato ficam sem produto correspondente. Empilhando, todo EAN do fato
+    # tem match na dimensão.
+    frames = []
+    for col_ean in ("EAN 1", "EAN 2", "EAN 3"):
+        if col_ean in df_raw.columns:
+            tmp = df_raw[[col_ean] + list(attr_map.keys())].copy()
+            tmp.rename(columns={col_ean: "EAN", **attr_map}, inplace=True)
+            frames.append(tmp)
+    df_dim = pd.concat(frames, ignore_index=True) if frames else df_raw.iloc[0:0].copy()
 
     # Tratar EAN
     if "EAN" in df_dim.columns:
@@ -990,7 +1004,15 @@ def gerar_dimensao_estado() -> pd.DataFrame:
             "ALIQUOTA_ICMS_VIGENTE": uf_aliquota.get(uf, ""),
         })
 
-    return pd.DataFrame(registros)
+    df_est = pd.DataFrame(registros)
+    _t = df_est["ALIQUOTA_ICMS_VIGENTE"].astype(str)
+    df_est["ALIQUOTA_ICMS_VIGENTE_PCT"] = pd.to_numeric(
+        _t.str.replace("%", "", regex=False)
+          .str.replace(",", ".", regex=False)
+          .where(~_t.str.lower().str.startswith("sem")),
+        errors="coerce",
+    ) / 100
+    return df_est
 
 
 def gerar_dimensao_calendario(
@@ -1054,7 +1076,24 @@ def exportar_para_powerbi(
         competencias = []
 
     for comp in competencias:
-        parte = df_fato[df_fato["COMPETENCIA"] == comp]
+        parte = df_fato[df_fato["COMPETENCIA"] == comp].copy()
+
+        # Tipos corretos para o Power BI. Sem isto, o Parquet grava datas e
+        # alíquota como Texto e o Power BI respeita o tipo embutido, quebrando
+        # eixo de tempo e cálculos.
+        parte["DATA_REFERENCIA"] = pd.to_datetime(parte["DATA_REFERENCIA"]).dt.date
+        parte["DATA_CARGA"] = pd.to_datetime(parte["DATA_CARGA"])
+        parte["COMPETENCIA_DATA"] = pd.to_datetime(
+            parte["COMPETENCIA"].astype(str) + "-01"
+        ).dt.date
+        _aliq = parte["ALIQUOTA_ICMS"].astype(str)
+        parte["ALIQUOTA_ICMS_PCT"] = pd.to_numeric(
+            _aliq.str.replace("%", "", regex=False)
+                 .str.replace(",", ".", regex=False)
+                 .where(~_aliq.str.lower().str.startswith("sem")),
+            errors="coerce",
+        ) / 100
+
         caminho_parte = dir_fato / f"fato_precos_{comp}.parquet"
         # Sobrescreve o mês (idempotente entre as execuções do mesmo mês).
         parte.to_parquet(caminho_parte, index=False, engine="pyarrow", compression="snappy")
