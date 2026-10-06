@@ -26,6 +26,7 @@ import smtplib
 import socket
 import sys
 import time
+import unicodedata
 from datetime import datetime
 from email.mime.text import MIMEText
 from logging.handlers import RotatingFileHandler
@@ -693,14 +694,23 @@ def _normalizar_texto_cabecalho(valor) -> str:
     return texto.upper()
 
 
-def detectar_linha_cabecalho(df: pd.DataFrame) -> int:
-    """
-    Detecta dinamicamente o cabeçalho real da CMED.
+def _sem_acento(texto: str) -> str:
+    """Remove acentos para comparação robusta de cabeçalhos."""
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", str(texto))
+        if not unicodedata.combining(c)
+    )
 
-    Não usa linha fixa. A detecção exige um conjunto de nomes de coluna
-    realmente presentes na tabela, evitando confundir as notas explicativas
-    que aparecem antes do cabeçalho e que também contêm palavras como
-    "produto".
+
+def detectar_linha_cabecalho(df: pd.DataFrame, limite_linhas: int = 200):
+    """
+    Detecta dinamicamente a linha de cabeçalho da CMED.
+
+    Retorna (idx, score, candidatos). idx é None se nenhuma linha atingir o
+    limiar. A comparação é INSENSÍVEL A ACENTO e aplica NOMES_ALTERNATIVOS,
+    então tolera variações como 'CODIGO GGREM'/'CÓDIGO GGREM',
+    'SUBSTANCIA'/'SUBSTÂNCIA', 'FORMA FARMACÊUTICA' etc. 'candidatos' traz as
+    melhores linhas (para diagnóstico quando a detecção falha).
     """
     identificadores = {
         "SUBSTÂNCIA", "CNPJ", "LABORATÓRIO", "CÓDIGO GGREM", "REGISTRO",
@@ -709,44 +719,42 @@ def detectar_linha_cabecalho(df: pd.DataFrame) -> int:
         "REGIME DE PREÇO", "RESTRIÇÃO HOSPITALAR", "CAP", "CONFAZ 87",
         "ICMS 0%", "ANÁLISE RECURSAL", "TARJA"
     }
+    ident_norm = {_sem_acento(x) for x in identificadores}
+    alt_norm = {
+        _sem_acento(re.sub(r"\s+", " ", str(k).replace("\xa0", " ").strip()).upper()): v
+        for k, v in NOMES_ALTERNATIVOS.items()
+    }
 
     def eh_coluna_preco(nome: str) -> bool:
         n = _normalizar_texto_cabecalho(nome)
-        # Aceita PF/PMC/PMVG e qualquer alíquota que a CMED publicar,
-        # mas ignora as colunas "ALC", que são valores derivados.
         return bool(re.match(r"^(PF|PMC|PMVG)\s+(SEM IMPOSTOS|\d+(?:,\d+)?%)$", n))
 
-    melhor_idx = None
-    melhor_score = -1
+    def norm(v):
+        t = _normalizar_texto_cabecalho(v)      # upper + espaços + %
+        t_na = _sem_acento(t)
+        if t_na in alt_norm:                    # mapeia alternativo -> canônico
+            t_na = _sem_acento(alt_norm[t_na])
+        return t, t_na
 
-    # As notas ficam no topo; 150 linhas é suficiente para detectar o header
-    # sem impor uma posição fixa. Se a CMED futuramente aumentar as notas,
-    # ainda assim podemos localizar o cabeçalho em uma janela ampla.
-    limite = min(len(df), 200)
+    melhor_idx, melhor_score = None, -1
+    candidatos = []
+    limite = min(len(df), limite_linhas)
     for idx in range(limite):
-        valores = [_normalizar_texto_cabecalho(v) for v in df.iloc[idx].tolist()]
-        valores = {v for v in valores if v}
+        pares = [norm(v) for v in df.iloc[idx].tolist()]
+        orig = {t for t, _ in pares if t}
+        sem_ac = {tna for _, tna in pares if tna}
 
-        acertos_id = len(valores & identificadores)
-        acertos_preco = sum(eh_coluna_preco(v) for v in valores)
-
-        # O cabeçalho real tem vários identificadores + várias colunas de preço.
+        acertos_id = len(sem_ac & ident_norm)
+        acertos_preco = sum(eh_coluna_preco(v) for v in orig)
         score = acertos_id * 10 + acertos_preco * 3
+
+        if acertos_id or acertos_preco:
+            candidatos.append((score, idx, acertos_id, acertos_preco, sorted(orig)[:12]))
         if acertos_id >= 8 and acertos_preco >= 3 and score > melhor_score:
-            melhor_idx = idx
-            melhor_score = score
+            melhor_idx, melhor_score = idx, score
 
-    if melhor_idx is None:
-        raise ValueError(
-            "Não foi possível identificar automaticamente o cabeçalho da CMED. "
-            "O arquivo não será processado para evitar gerar dados incorretos."
-        )
-
-    logging.info(
-        f"Cabeçalho CMED detectado automaticamente na linha Excel {melhor_idx + 1}. "
-        f"(índice pandas {melhor_idx}; score={melhor_score})."
-    )
-    return melhor_idx
+    candidatos.sort(reverse=True)
+    return melhor_idx, melhor_score, candidatos[:3]
 
 
 def normalizar_nomes_colunas(colunas: list) -> list:
@@ -776,14 +784,49 @@ def _selecionar_engine(caminho: Path) -> str:
 
 
 def ler_arquivo_cmed(caminho: Path) -> pd.DataFrame:
-    """Lê arquivo CMED, encontra o cabeçalho dinamicamente e valida a estrutura."""
+    """Lê arquivo CMED, encontra o cabeçalho dinamicamente e valida a estrutura.
+
+    Varre TODAS as abas (a CMED pode adicionar uma aba de instruções antes da
+    tabela) e escolhe a aba/linha com melhor pontuação de cabeçalho. Se nada
+    for encontrado, registra no log os melhores candidatos de cada aba — isso
+    revela o cabeçalho real quando o layout da ANVISA muda.
+    """
     logging.info(f"Lendo arquivo: {caminho}")
-
     engine = _selecionar_engine(caminho)
-    df_raw = pd.read_excel(caminho, header=None, dtype=str, engine=engine)
-    idx_header = detectar_linha_cabecalho(df_raw)
+    xls = pd.ExcelFile(caminho, engine=engine)
 
-    df = pd.read_excel(caminho, header=idx_header, dtype=str, engine=engine)
+    melhor = None  # (score, aba, idx_header)
+    diagnostico = {}
+    for aba in xls.sheet_names:
+        df_raw = xls.parse(sheet_name=aba, header=None, dtype=str)
+        idx, score, candidatos = detectar_linha_cabecalho(df_raw)
+        diagnostico[aba] = candidatos
+        if idx is not None and (melhor is None or score > melhor[0]):
+            melhor = (score, aba, idx)
+
+    if melhor is None:
+        linhas = ["Não foi possível identificar o cabeçalho. Melhores candidatos por aba:"]
+        for aba, cands in diagnostico.items():
+            linhas.append(f"  [aba {aba!r}]")
+            if not cands:
+                linhas.append("    (nenhuma linha com colunas reconhecíveis)")
+            for score, idx, nid, npreco, amostra in cands:
+                linhas.append(
+                    f"    linha {idx + 1}: ids={nid} precos={npreco} amostra={amostra}"
+                )
+        logging.error("\n".join(linhas))
+        raise ValueError(
+            "Não foi possível identificar automaticamente o cabeçalho da CMED. "
+            "O arquivo não será processado para evitar gerar dados incorretos."
+        )
+
+    _, aba, idx_header = melhor
+    logging.info(
+        f"Cabeçalho CMED detectado na aba {aba!r}, linha Excel {idx_header + 1} "
+        f"(índice pandas {idx_header}; score={melhor[0]})."
+    )
+
+    df = xls.parse(sheet_name=aba, header=idx_header, dtype=str)
     df.columns = normalizar_nomes_colunas(list(df.columns))
     df.dropna(how="all", inplace=True)
 
