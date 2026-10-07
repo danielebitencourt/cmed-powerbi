@@ -1,0 +1,36 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Configuração do ETL DCB (Lista consolidada das DCB — ANVISA)
+# IMPORTANTE (segurança): NÃO coloque senhas ou tokens neste arquivo.
+# Ele fica versionado no GitHub. Credenciais de e-mail (se usar alertas)
+# devem ir em GitHub Secrets e são lidas por variáveis de ambiente:
+#   SMTP_REMETENTE, SMTP_SENHA, SMTP_DESTINATARIOS, EMAIL_ALERTA_ATIVO
+# Caminhos são relativos à pasta dcb/.
+# ═══════════════════════════════════════════════════════════════════════
+
+# Coleção "Farmacopeia: Denominações Comuns Brasileiras" (mais recentes primeiro).
+url_colecao: "https://bibliotecadigital.anvisa.gov.br/jspui/handle/anvisa/11933?sort_by=2&order=DESC&rpp=40"
+url_rss: "https://bibliotecadigital.anvisa.gov.br/jspui/feed/rss_2.0/anvisa/11933"
+
+diretorio_saida: "dados/processed"
+diretorio_original: "dados/original"
+diretorio_log: "logs"
+arquivo_estado: "estado.json"
+
+timeout_segundos: 90
+tentativas_max: 3
+
+# Trava de qualidade: abaixo disso o arquivo é considerado incompleto
+# e nada é substituído (a lista tem ~12.700 DCBs).
+linhas_minimas: 5000
+
+user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+# Alertas por e-mail ficam desativados por padrão.
+# Para ativar, defina EMAIL_ALERTA_ATIVO=true nos Secrets (não aqui).
+email_alerta:
+  ativo: false
+  smtp_host: "smtp.gmail.com"
+  smtp_porta: 587
+  remetente: ""       # preenchido via Secret SMTP_REMETENTE
+  senha: ""           # preenchido via Secret SMTP_SENHA
+  destinatarios: []   # preenchido via Secret SMTP_DESTINATARIOS
