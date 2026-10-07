@@ -1,129 +1,187 @@
 # Automação CMED → Power BI
 
-Solução de importação automática mensal dos dados oficiais de preços de medicamentos da CMED/ANVISA para o Power BI, com relacionamento EAN × Estado.
+Importação automática mensal dos preços oficiais de medicamentos da CMED/ANVISA (PMC e PF/PMVG) para o Power BI, com relacionamento EAN × Estado e histórico de alíquotas de ICMS.
 
 ---
 
 ## Visão geral
 
-O sistema opera em duas camadas complementares:
+**Camada ETL (Python + GitHub Actions)** — o `etl_cmed.py` baixa os arquivos PMC e PF/PMVG do site da ANVISA, trata a qualidade dos dados (EAN, separadores decimais, asteriscos) e faz o unpivot para uma tabela fato com granularidade EAN × UF × Tipo de Preço × Competência. O GitHub Actions executa o script automaticamente e versiona o resultado neste repositório.
 
-**Camada ETL (Python)** — baixa os arquivos PMC e PF/PMVG diretamente do site da ANVISA, trata qualidade de dados (EAN, separadores decimais, asteriscos) e faz o unpivot para gerar uma tabela fato com granularidade EAN × UF × Tipo de Preço × Competência.
-
-**Camada analítica (Power BI)** — consome os CSVs tratados via Power Query, mantém modelo estrela com dimensões Medicamento, Estado e Calendário, e disponibiliza medidas DAX pré-configuradas para análise de preços.
+**Camada analítica (Power BI)** — consome os arquivos de `dados/processed/` em um modelo estrela com as dimensões Medicamento, Estado e Calendário, mais as tabelas de histórico de alíquotas.
 
 ---
 
-## Estrutura de pastas
+## Estrutura do repositório
 
 ```
-CMED_PowerBI/
-├── etl_cmed.py              ← Script principal ETL
-├── config.yaml              ← Configurações (URLs, caminhos, alertas)
-├── requirements.txt         ← Dependências Python
-├── README.md                ← Este arquivo
+cmed-powerbi/
+├── etl_cmed.py                    ← ETL principal (download, tratamento, exportação)
+├── gerar_historico_aliquotas.py   ← Gera o histórico de alíquotas de ICMS
+├── aliquotas_icms.csv             ← FONTE DA VERDADE das alíquotas por UF
+├── config.yaml                    ← Configurações (URL, pastas, retry, alertas)
+├── requirements.txt               ← Dependências Python (versões fixadas)
 │
 ├── dados/
-│   ├── raw/                 ← Arquivos originais baixados da ANVISA
-│   │   └── 2026-07/
-│   ├── processed/           ← CSVs tratados para o Power BI
-│   │   ├── fato_precos.csv
-│   │   ├── dim_medicamento.csv
-│   │   ├── dim_estado.csv
-│   │   └── dim_calendario.csv
-│   └── historico/           ← Backup mensal
+│   └── processed/                 ← Saída para o Power BI
+│       ├── fato/
+│       │   └── fato_precos_AAAA-MM.parquet   ← um arquivo por competência
+│       ├── dim_medicamento.csv
+│       ├── dim_estado.csv
+│       ├── dim_calendario.csv
+│       ├── dim_aliquota_historico.csv
+│       └── fato_aliquota_mensal.csv
 │
-├── logs/
-│   └── cmed_etl_YYYYMM.log
-│
-├── powerbi/
-│   ├── PowerQuery_CMED.pq   ← Código M para o Power BI
-│   └── medidas_dax.dax       ← Medidas DAX prontas
-│
-└── scripts/
-    └── agendar_windows.bat   ← Agendamento no Windows
+└── .github/
+    ├── workflows/cmed.yml         ← Agendamento do ETL no GitHub Actions
+    └── cmed/estado.json           ← Última competência processada
+```
+
+Pastas geradas só na execução e **não versionadas** (ver `.gitignore`): `dados/raw/` (arquivos originais da ANVISA), `dados/historico/` e `logs/`.
+
+---
+
+## Execução automática (GitHub Actions)
+
+O workflow `ETL CMED Mensal` roda nos dias **1, 5, 10 e 15 de cada mês às 11:00 UTC (08:00 de Brasília)**. As execuções extras garantem a captura do arquivo mesmo que a ANVISA publique com atraso.
+
+A cada execução ele:
+1. Instala as dependências de `requirements.txt`.
+2. Executa `python etl_cmed.py`.
+3. Faz commit de `dados/processed/` e `.github/cmed/estado.json`, abortando se algum arquivo passar de 100 MB.
+
+Para rodar manualmente: aba **Actions → ETL CMED Mensal → Run workflow**.
+
+### Alertas por e-mail (opcional)
+
+Desativados por padrão. Para ativar, cadastre em **Settings → Secrets and variables → Actions**:
+
+| Secret | Conteúdo |
+|---|---|
+| `EMAIL_ALERTA_ATIVO` | `true` |
+| `SMTP_REMETENTE` | e-mail remetente |
+| `SMTP_SENHA` | senha de app do e-mail |
+| `SMTP_DESTINATARIOS` | destinatários |
+
+Nunca coloque senhas no `config.yaml` — ele é versionado.
+
+---
+
+## Execução local
+
+Pré-requisitos: Python 3.10+ (o Actions usa 3.12) e acesso a gov.br/anvisa.
+
+```bash
+pip install -r requirements.txt
+python etl_cmed.py                         # competência atual
+python etl_cmed.py --competencia 2026-07   # forçar uma competência
+python etl_cmed.py --config outro.yaml     # configuração alternativa
 ```
 
 ---
 
-## Instalação
+## Alíquotas de ICMS
 
-### 1. Pré-requisitos
+As alíquotas por UF **não ficam mais no código**. A fonte da verdade é `aliquotas_icms.csv`, um log com vigência:
 
-- Python 3.10 ou superior
-- Power BI Desktop (versão atual)
-- Acesso à internet (site gov.br/anvisa)
-
-### 2. Instalar dependências
-
-```bash
-cd C:\CMED_PowerBI
-pip install -r requirements.txt
+```
+UF,ALIQUOTA_ICMS,VIGENCIA_INICIO,FONTE,OBS
+BA,"20,5%",2024-01-01,RICMS-BA,
 ```
 
-### 3. Configurar
+O ETL escolhe, para cada UF, a linha com a `VIGENCIA_INICIO` mais recente até a data da execução. Se o arquivo faltar ou estiver inválido, usa um mapeamento interno de segurança e registra um aviso no log.
 
-Edite `config.yaml` com os caminhos do seu ambiente. Os campos mínimos a ajustar são os diretórios de saída e, opcionalmente, os dados de e-mail para alertas.
+### Registrar uma mudança de alíquota
 
-### 4. Primeira execução
+1. **Não edite a linha antiga.** Adicione uma **nova linha** em `aliquotas_icms.csv` com a nova alíquota, a `VIGENCIA_INICIO` e a fonte legal.
+2. Rode localmente:
+   ```bash
+   python gerar_historico_aliquotas.py                # grade até o mês atual
+   python gerar_historico_aliquotas.py --ate 2027-06  # projetar até jun/2027
+   ```
+3. Faça commit de `aliquotas_icms.csv` e dos dois CSVs gerados em `dados/processed/`.
 
-```bash
-python etl_cmed.py
-```
+O script fecha automaticamente a vigência anterior e recalcula:
+- `dim_aliquota_historico.csv` — uma linha por período de vigência de cada UF (início, fim, vigente, fonte).
+- `fato_aliquota_mensal.csv` — grade mês × UF com a alíquota vigente; a coluna `MUDOU` marca o mês da mudança.
 
-O script vai acessar o site da ANVISA, baixar os dois arquivos (PMC e PF), processar e exportar os CSVs para `dados/processed/`.
+> ⚠️ O workflow do GitHub Actions **não** executa `gerar_historico_aliquotas.py`. Sempre que alterar `aliquotas_icms.csv`, rode-o manualmente (passo 2).
 
 ---
 
 ## Uso no Power BI
 
-### Importar as queries
+### Fonte de dados
 
-1. Abra o Power BI Desktop
-2. Vá em **Página Inicial → Transformar Dados → Editor do Power Query**
-3. Crie uma nova Query em branco para cada seção do arquivo `powerbi/PowerQuery_CMED.pq`:
-   - `pCaminhoDados` — parâmetro com o caminho dos CSVs
-   - `fCMED_Precos` — tabela fato
-   - `dMedicamento` — dimensão medicamento
-   - `dEstado` — dimensão estado
-   - `dCalendario` — dimensão calendário
-4. Ajuste o parâmetro `pCaminhoDados` para apontar para sua pasta `dados/processed/`
-5. Clique em **Fechar e Aplicar**
+| Tabela | Arquivo | Como importar |
+|---|---|---|
+| `fCMED_Precos` | `dados/processed/fato/*.parquet` | **Obter Dados → Pasta → Combinar** (lê todos os meses) |
+| `dMedicamento` | `dim_medicamento.csv` | Texto/CSV (UTF-8) |
+| `dEstado` | `dim_estado.csv` | Texto/CSV (UTF-8) |
+| `dCalendario` | `dim_calendario.csv` | Texto/CSV (UTF-8) |
+| `dAliquotaHistorico` | `dim_aliquota_historico.csv` | Texto/CSV (UTF-8) |
+| `fAliquotaMensal` | `fato_aliquota_mensal.csv` | Texto/CSV (UTF-8) |
 
-### Configurar relacionamentos
+Os arquivos podem ser lidos de uma cópia local do repositório ou direto do GitHub (`https://raw.githubusercontent.com/danielebitencourt/cmed-powerbi/main/dados/processed/...`).
 
-No Model View do Power BI, confirme os relacionamentos (normalmente criados automaticamente):
+### Relacionamentos
 
 | De | Para | Cardinalidade |
 |---|---|---|
 | fCMED_Precos[EAN] | dMedicamento[EAN] | Muitos:1 |
 | fCMED_Precos[ESTADO_UF] | dEstado[ESTADO_UF] | Muitos:1 |
 | fCMED_Precos[DATA_REFERENCIA] | dCalendario[DATA] | Muitos:1 |
+| fAliquotaMensal[ESTADO_UF] | dEstado[ESTADO_UF] | Muitos:1 |
+| fAliquotaMensal[COMPETENCIA_DATA] | dCalendario[DATA] | Muitos:1 |
+| dAliquotaHistorico[ESTADO_UF] | dEstado[ESTADO_UF] | Muitos:1 |
 
 Todos com filtro cruzado **unidirecional** (da dimensão para a fato).
 
-### Adicionar medidas DAX
-
-As medidas estão documentadas em `powerbi/medidas_dax.dax`. Crie cada uma na tabela `fCMED_Precos` via **Nova Medida** no Power BI.
-
 ---
 
-## Agendamento mensal
+## Modelo de dados
 
-### Windows Task Scheduler (recomendado)
+```
+                         ┌──────────────┐
+                         │ dCalendario  │
+                         │   DATA (PK)  │
+                         └──────┬───────┘
+                                │ 1
+                 ┌──────────────┴───────────────┐
+                 │ *                            │ *
+┌──────────────┐ ┌──────────────────┐  ┌──────────────────┐
+│ dMedicamento │ │  fCMED_Precos    │  │ fAliquotaMensal  │
+│   EAN (PK)   │─<  EAN             │  │ COMPETENCIA_DATA │
+└──────────────┘ │  ESTADO_UF       │  │ ESTADO_UF        │
+                 │  DATA_REFERENCIA │  │ ALIQUOTA_ICMS    │
+                 │  TIPO_PRECO      │  │ MUDOU            │
+                 │  ALIQUOTA_ICMS   │  └────────┬─────────┘
+                 │  VALOR           │           │ *
+                 │  COMPETENCIA     │           │
+                 └────────┬─────────┘           │
+                          │ *                   │
+                          └──────┬──────────────┘
+                                 │ 1
+                          ┌──────┴───────┐   ┌────────────────────┐
+                          │   dEstado    │──<│ dAliquotaHistorico │
+                          │ ESTADO_UF(PK)│   │ ESTADO_UF          │
+                          └──────────────┘   │ VIGENCIA_INICIO/FIM│
+                                             └────────────────────┘
+```
 
-Execute `scripts/agendar_windows.bat` como Administrador. Edite os caminhos dentro do .bat antes de executar. A tarefa fica configurada para rodar no dia 2 de cada mês às 08:00.
+### Colunas principais da fato (`fato_precos_AAAA-MM.parquet`)
 
-### Power BI Service + Gateway
-
-1. Instale o **Gateway de Dados Local** no servidor onde os CSVs ficam
-2. Publique o relatório no Power BI Service
-3. Em **Configurações do Dataset → Atualização Agendada**, configure atualização mensal no dia 3 (um dia após o ETL)
-4. Aponte a fonte de dados para o caminho dos CSVs via Gateway
-
-### Fluxo combinado (recomendado para empresas)
-
-Python ETL roda no dia 2 → gera CSVs → Gateway monitora a pasta → Power BI Service atualiza o dataset no dia 3.
+| Coluna | Descrição |
+|---|---|
+| `EAN` | EAN-13 tratado |
+| `TIPO_PRECO` | `PMC` ou `PF` |
+| `ESTADO_UF` | UF à qual a alíquota foi mapeada |
+| `ALIQUOTA_ICMS` / `ALIQUOTA_ICMS_PCT` | Alíquota em texto (`20,5%`) e em número (`0,205`) |
+| `VALOR` | Preço em R$ |
+| `COMPETENCIA` / `COMPETENCIA_DATA` / `DATA_REFERENCIA` | Mês de referência (`AAAA-MM` e data do 1º dia) |
+| `FLAG_ASTERISCO` | Valor veio com `*` na planilha da CMED |
+| `EAN_INVALIDO` | Dígito verificador do EAN não confere |
+| `DATA_CARGA` | Data e hora do processamento |
 
 ---
 
@@ -135,58 +193,19 @@ Python ETL roda no dia 2 → gera CSVs → Gateway monitora a pasta → Power BI
 | EAN inválido (dígito verificador) | Sinalizado com `EAN_INVALIDO = True` |
 | Valor com ponto como decimal | Detecta e corrige separadores BR/US |
 | Asterisco (*) no valor | Remove e sinaliza `FLAG_ASTERISCO = True` |
-| Cabeçalho em posição variável | Detecta linha com "SUBSTÂNCIA" automaticamente |
+| Cabeçalho em posição variável | Detecta a linha com "SUBSTÂNCIA" automaticamente |
 | Colunas renomeadas pela ANVISA | Mapeamento de nomes alternativos |
-| Site fora do ar | Retry 3× com intervalo de 30s + e-mail de alerta |
+| Novas colunas de alíquota | Colunas PF/PMC detectadas dinamicamente |
+| Site fora do ar | Retry 3× com intervalo de 30 s + alerta por e-mail (se ativo) |
 
 ---
 
-## Modelo de dados
+## Notas técnicas
 
-```
-            ┌──────────────┐
-            │ dCalendario  │
-            │   DATA (PK)  │
-            └──────┬───────┘
-                   │ 1
-                   │
-                   │ *
-┌──────────────┐   ┌──────────────────┐   ┌──────────────┐
-│ dMedicamento │   │  fCMED_Precos    │   │   dEstado    │
-│   EAN (PK)   │──<│  EAN             │>──│ ESTADO_UF    │
-│              │ 1 │  ESTADO_UF       │ * │   (PK)       │
-│              │   │  DATA_REFERENCIA │   │              │
-└──────────────┘   │  TIPO_PRECO      │   └──────────────┘
-                   │  ALIQUOTA_ICMS   │
-                   │  VALOR           │
-                   │  COMPETENCIA     │
-                   └──────────────────┘
-```
-
----
-
-## Mapeamento ICMS → UF
-
-Conforme Resolução CM-CMED nº 2/2024:
-
-| Alíquota | Estados |
-|---|---|
-| 0% (isento CONFAZ) | AC, AM, AP, PA, RO, RR, TO, MT, MS, GO, DF |
-| 12% | ES, RS |
-| 17% | AL, BA, CE, MA, PB, PE, PI, RN, SE, PR, SC, SP |
-| 17,5% | RJ |
-| 18% | MG |
-| 19,5% a 22% | Verificar legislação vigente antes de cada carga |
-
-Atualize o mapeamento em `etl_cmed.py` (constante `MAPEAMENTO_ICMS_UF`) sempre que houver mudança legislativa.
-
----
-
-## Notas de segurança
-
-- Nenhuma credencial é armazenada em texto plano nos CSVs — dados são exclusivamente preços públicos da ANVISA.
-- O `config.yaml` pode conter senha de e-mail — proteja com permissões de arquivo restritas ou use variável de ambiente.
-- Os arquivos gerados seguem encoding `utf-8-sig` para compatibilidade com Excel e Power BI sem perda de caracteres acentuados.
+- A fato é gravada em **Parquet particionado por mês**: comprime muito (centenas de MB em CSV viram ~15 MB), fica abaixo do limite de 100 MB do GitHub e evita um arquivo único que cresce sem parar. Reprocessar um mês sobrescreve apenas o arquivo daquele mês.
+- `dim_medicamento.csv` é **acumulada**: novos EANs são adicionados e os existentes são atualizados com a versão mais recente.
+- Os CSVs usam encoding `utf-8-sig`, compatível com Excel e Power BI sem perda de acentos.
+- Os arquivos de `dados/processed/` são gerados pelos scripts. Edições manuais neles serão sobrescritas na próxima execução — altere o script, o `config.yaml` ou o `aliquotas_icms.csv`.
 
 ---
 
