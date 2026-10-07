@@ -6,7 +6,7 @@ Importação automática mensal dos preços oficiais de medicamentos da CMED/ANV
 
 ## Visão geral
 
-**Camada ETL (Python + GitHub Actions)** — o `etl_cmed.py` baixa os arquivos PMC e PF/PMVG do site da ANVISA, trata a qualidade dos dados (EAN, separadores decimais, asteriscos) e faz o unpivot para uma tabela fato com granularidade EAN × UF × Tipo de Preço × Competência. O GitHub Actions executa o script automaticamente e versiona o resultado neste repositório.
+**Camada ETL (Python + GitHub Actions)** — o `etl_cmed.py` baixa os arquivos PMC e PF/PMVG do site da ANVISA, trata a qualidade dos dados (EAN, separadores decimais, asteriscos) e faz o unpivot para uma tabela fato com granularidade EAN × Tipo de Preço × Alíquota × Competência. A fato **não tem UF**: os estados se ligam a ela pela alíquota, através de uma tabela ponte. O GitHub Actions executa o script automaticamente e versiona o resultado neste repositório.
 
 **Camada analítica (Power BI)** — consome os arquivos de `dados/processed/` em um modelo estrela com as dimensões Medicamento, Estado e Calendário, mais as tabelas de histórico de alíquotas.
 
@@ -29,6 +29,8 @@ cmed-powerbi/
 │       ├── dim_medicamento.csv
 │       ├── dim_estado.csv
 │       ├── dim_calendario.csv
+│       ├── dim_aliquota.csv
+│       ├── ponte_aliquota_estado.csv
 │       ├── dim_aliquota_historico.csv
 │       └── fato_aliquota_mensal.csv
 │
@@ -48,7 +50,7 @@ O workflow `ETL CMED Mensal` roda nos dias **1, 5, 10 e 15 de cada mês às 11:0
 A cada execução ele:
 1. Instala as dependências de `requirements.txt`.
 2. Executa `python etl_cmed.py`.
-3. Executa `python gerar_historico_aliquotas.py` (histórico de alíquotas).
+3. Executa `python gerar_historico_aliquotas.py` (dAliquota, ponte e histórico de alíquotas).
 4. Faz commit de `dados/processed/` e `.github/cmed/estado.json`, abortando se algum arquivo passar de 100 MB.
 
 Para rodar manualmente: aba **Actions → ETL CMED Mensal → Run workflow**.
@@ -90,7 +92,7 @@ UF,ALIQUOTA_ICMS,VIGENCIA_INICIO,FONTE,OBS
 BA,"20,5%",2024-01-01,RICMS-BA,
 ```
 
-O ETL escolhe, para cada UF, a linha com a `VIGENCIA_INICIO` mais recente até a data da execução. Se o arquivo faltar ou estiver inválido, usa um mapeamento interno de segurança e registra um aviso no log.
+Para cada competência e UF vale a linha com a `VIGENCIA_INICIO` mais recente até o 1º dia do mês. É esse arquivo que define a ponte alíquota → estados.
 
 ### Registrar uma mudança de alíquota
 
@@ -103,6 +105,8 @@ O ETL escolhe, para cada UF, a linha com a `VIGENCIA_INICIO` mais recente até a
 3. Faça commit de `aliquotas_icms.csv` e dos dois CSVs gerados em `dados/processed/`.
 
 O script fecha automaticamente a vigência anterior e recalcula:
+- `dim_aliquota.csv` — uma linha por `CHAVE_ALIQUOTA` (`AAAA-MM|alíquota`), com as UFs que usavam aquela alíquota no mês.
+- `ponte_aliquota_estado.csv` — `CHAVE_ALIQUOTA` × `ESTADO_UF`: liga a fato aos estados.
 - `dim_aliquota_historico.csv` — uma linha por período de vigência de cada UF (início, fim, vigente, fonte).
 - `fato_aliquota_mensal.csv` — grade mês × UF com a alíquota vigente; a coluna `MUDOU` marca o mês da mudança.
 
@@ -120,6 +124,8 @@ O script fecha automaticamente a vigência anterior e recalcula:
 | `dMedicamento` | `dim_medicamento.csv` | Texto/CSV (UTF-8) |
 | `dEstado` | `dim_estado.csv` | Texto/CSV (UTF-8) |
 | `dCalendario` | `dim_calendario.csv` | Texto/CSV (UTF-8) |
+| `dAliquota` | `dim_aliquota.csv` | Texto/CSV (UTF-8) |
+| `pAliquotaEstado` | `ponte_aliquota_estado.csv` | Texto/CSV (UTF-8) |
 | `dAliquotaHistorico` | `dim_aliquota_historico.csv` | Texto/CSV (UTF-8) |
 | `fAliquotaMensal` | `fato_aliquota_mensal.csv` | Texto/CSV (UTF-8) |
 
@@ -127,47 +133,59 @@ Os arquivos podem ser lidos de uma cópia local do repositório ou direto do Git
 
 ### Relacionamentos
 
-| De | Para | Cardinalidade |
-|---|---|---|
-| fCMED_Precos[EAN] | dMedicamento[EAN] | Muitos:1 |
-| fCMED_Precos[ESTADO_UF] | dEstado[ESTADO_UF] | Muitos:1 |
-| fCMED_Precos[DATA_REFERENCIA] | dCalendario[DATA] | Muitos:1 |
-| fAliquotaMensal[ESTADO_UF] | dEstado[ESTADO_UF] | Muitos:1 |
-| fAliquotaMensal[COMPETENCIA_DATA] | dCalendario[DATA] | Muitos:1 |
-| dAliquotaHistorico[ESTADO_UF] | dEstado[ESTADO_UF] | Muitos:1 |
+| De | Para | Cardinalidade | Filtro cruzado |
+|---|---|---|---|
+| fCMED_Precos[EAN] | dMedicamento[EAN] | Muitos:1 | Único |
+| fCMED_Precos[CHAVE_ALIQUOTA] | dAliquota[CHAVE_ALIQUOTA] | Muitos:1 | Único |
+| fCMED_Precos[DATA_REFERENCIA] | dCalendario[DATA] | Muitos:1 | Único |
+| pAliquotaEstado[CHAVE_ALIQUOTA] | dAliquota[CHAVE_ALIQUOTA] | Muitos:1 | **Ambos** |
+| pAliquotaEstado[ESTADO_UF] | dEstado[ESTADO_UF] | Muitos:1 | Único |
+| fAliquotaMensal[ESTADO_UF] | dEstado[ESTADO_UF] | Muitos:1 | Único |
+| fAliquotaMensal[COMPETENCIA_DATA] | dCalendario[DATA] | Muitos:1 | Único |
+| dAliquotaHistorico[ESTADO_UF] | dEstado[ESTADO_UF] | Muitos:1 | Único |
 
-Todos com filtro cruzado **unidirecional** (da dimensão para a fato).
+**Como o filtro de estado chega à fato:** dEstado → pAliquotaEstado → dAliquota → fCMED_Precos. A relação ponte↔dAliquota precisa ser **bidirecional** (Ambos); todas as outras são unidirecionais.
+
+**Por que a chave inclui a competência:** a alíquota de uma UF muda com o tempo. `2026-09|20%` liga os preços de 20% de setembro às UFs que usavam 20% *em setembro*; se em 2027 SP passar para 20%, os meses antigos continuam corretos.
+
+**Comportamento esperado:**
+- Filtrando uma UF, aparecem os preços da alíquota dela naquele mês.
+- Filtrando várias UFs com a mesma alíquota, cada preço aparece **uma vez** (não é duplicado por estado).
+- Alíquotas sem estado (`Sem Impostos`, `0%`, `12%`, `17,5%`, `21%`) aparecem sem filtro de UF e somem quando uma UF é selecionada. Use `dAliquota[QTD_UFS] = 0` para isolá-las.
 
 ---
 
 ## Modelo de dados
 
 ```
-                         ┌──────────────┐
-                         │ dCalendario  │
-                         │   DATA (PK)  │
-                         └──────┬───────┘
-                                │ 1
-                 ┌──────────────┴───────────────┐
-                 │ *                            │ *
-┌──────────────┐ ┌──────────────────┐  ┌──────────────────┐
-│ dMedicamento │ │  fCMED_Precos    │  │ fAliquotaMensal  │
-│   EAN (PK)   │─<  EAN             │  │ COMPETENCIA_DATA │
-└──────────────┘ │  ESTADO_UF       │  │ ESTADO_UF        │
-                 │  DATA_REFERENCIA │  │ ALIQUOTA_ICMS    │
-                 │  TIPO_PRECO      │  │ MUDOU            │
-                 │  ALIQUOTA_ICMS   │  └────────┬─────────┘
-                 │  VALOR           │           │ *
-                 │  COMPETENCIA     │           │
-                 └────────┬─────────┘           │
-                          │ *                   │
-                          └──────┬──────────────┘
-                                 │ 1
-                          ┌──────┴───────┐   ┌────────────────────┐
-                          │   dEstado    │──<│ dAliquotaHistorico │
-                          │ ESTADO_UF(PK)│   │ ESTADO_UF          │
-                          └──────────────┘   │ VIGENCIA_INICIO/FIM│
-                                             └────────────────────┘
+┌──────────────┐      ┌──────────────────┐      ┌──────────────┐
+│ dMedicamento │ 1  * │  fCMED_Precos    │ *  1 │ dCalendario  │
+│   EAN (PK)   │─────<│  EAN             │>─────│   DATA (PK)  │
+└──────────────┘      │  CHAVE_ALIQUOTA  │      └──────┬───────┘
+                      │  DATA_REFERENCIA │             │ 1
+                      │  TIPO_PRECO      │             │ *
+                      │  ALIQUOTA_ICMS   │    ┌────────┴─────────┐
+                      │  VALOR           │    │ fAliquotaMensal  │
+                      └────────┬─────────┘    │ COMPETENCIA_DATA │
+                               │ *            │ ESTADO_UF        │
+                               │ 1            └────────┬─────────┘
+                      ┌────────┴─────────┐             │ *
+                      │    dAliquota     │             │
+                      │ CHAVE_ALIQUOTA PK│             │
+                      └────────┬─────────┘             │
+                               │ 1  ⇅ (Ambos)          │
+                               │ *                     │
+                      ┌────────┴─────────┐             │
+                      │ pAliquotaEstado  │             │
+                      │ CHAVE_ALIQUOTA   │             │
+                      │ ESTADO_UF        │             │
+                      └────────┬─────────┘             │
+                               │ *                     │
+                               │ 1                     │
+                      ┌────────┴─────────┐ 1           │
+                      │     dEstado      │─────────────┘
+                      │  ESTADO_UF (PK)  │──<  dAliquotaHistorico
+                      └──────────────────┘
 ```
 
 ### Colunas principais da fato (`fato_precos_AAAA-MM.parquet`)
@@ -176,8 +194,8 @@ Todos com filtro cruzado **unidirecional** (da dimensão para a fato).
 |---|---|
 | `EAN` | EAN-13 tratado |
 | `TIPO_PRECO` | `PMC` ou `PF` |
-| `ESTADO_UF` | UF à qual a alíquota foi mapeada |
 | `ALIQUOTA_ICMS` / `ALIQUOTA_ICMS_PCT` | Alíquota em texto (`20,5%`) e em número (`0,205`) |
+| `CHAVE_ALIQUOTA` | `AAAA-MM\|alíquota` — liga à dAliquota (e, pela ponte, aos estados) |
 | `VALOR` | Preço em R$ |
 | `COMPETENCIA` / `COMPETENCIA_DATA` / `DATA_REFERENCIA` | Mês de referência (`AAAA-MM` e data do 1º dia) |
 | `FLAG_ASTERISCO` | Valor veio com `*` na planilha da CMED |
@@ -203,7 +221,7 @@ Todos com filtro cruzado **unidirecional** (da dimensão para a fato).
 
 ## Notas técnicas
 
-- A fato é gravada em **Parquet particionado por mês**: comprime muito (centenas de MB em CSV viram ~15 MB), fica abaixo do limite de 100 MB do GitHub e evita um arquivo único que cresce sem parar. Reprocessar um mês sobrescreve apenas o arquivo daquele mês.
+- A fato é gravada em **Parquet particionado por mês**, sem UF (uma linha por EAN × tipo × alíquota): comprime muito (centenas de MB em CSV viram poucos MB), fica abaixo do limite de 100 MB do GitHub e evita um arquivo único que cresce sem parar. Reprocessar um mês sobrescreve apenas o arquivo daquele mês.
 - `dim_medicamento.csv` é **acumulada**: novos EANs são adicionados e os existentes são atualizados com a versão mais recente.
 - Os CSVs usam encoding `utf-8-sig`, compatível com Excel e Power BI sem perda de acentos.
 - Os arquivos de `dados/processed/` são gerados pelos scripts. Edições manuais neles serão sobrescritas na próxima execução — altere o script, o `config.yaml` ou o `aliquotas_icms.csv`.

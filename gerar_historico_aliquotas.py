@@ -17,6 +17,16 @@ e produz dois artefatos prontos para o Power BI:
    relacionando com dCalendario (por COMPETENCIA_DATA) e dEstado (por ESTADO_UF).
    A coluna MUDOU marca o mês exato em que a alíquota daquela UF mudou.
 
+3) ponte_aliquota_estado.csv
+   Tabela ponte CHAVE_ALIQUOTA × UF. A fato de preços NÃO tem UF: tem só a
+   alíquota (CHAVE_ALIQUOTA = 'AAAA-MM|alíquota'). A ponte diz quais UFs
+   usavam cada alíquota em cada competência, ligando a fato a dEstado.
+
+4) dim_aliquota.csv
+   Uma linha por CHAVE_ALIQUOTA: todas as alíquotas presentes na fato
+   (inclusive "Sem Impostos", "0%" e colunas sem UF) e na ponte. Fica entre
+   a fato e a ponte, garantindo relacionamentos 1:* no Power BI.
+
 COMO REGISTRAR UMA MUDANÇA DE ALÍQUOTA (o motivo de tudo isto existir):
    NÃO edite a linha antiga. ABRA UMA NOVA LINHA em aliquotas_icms.csv com a
    nova alíquota e sua VIGENCIA_INICIO. Rode este script. Ele fecha sozinho a
@@ -169,6 +179,45 @@ def montar_grade_mensal(df: pd.DataFrame, ate: date) -> pd.DataFrame:
     return grade.sort_values(["ESTADO_UF", "COMPETENCIA_DATA"]).reset_index(drop=True)
 
 
+def chave_aliquota(competencia: str, aliquota: str) -> str:
+    """Mesma regra de etl_cmed.chave_aliquota: '2026-09|20,5%'."""
+    return f"{competencia}|{aliquota}"
+
+
+def montar_ponte(grade: pd.DataFrame) -> pd.DataFrame:
+    """Ponte CHAVE_ALIQUOTA × UF a partir da grade mensal."""
+    ponte = grade[["COMPETENCIA", "ALIQUOTA_ICMS", "ESTADO_UF"]].copy()
+    ponte.insert(0, "CHAVE_ALIQUOTA", [
+        chave_aliquota(c, a) for c, a in zip(ponte["COMPETENCIA"], ponte["ALIQUOTA_ICMS"])
+    ])
+    return ponte.sort_values(["CHAVE_ALIQUOTA", "ESTADO_UF"]).reset_index(drop=True)
+
+
+def montar_dim_aliquota(ponte: pd.DataFrame, saida_dir: Path) -> pd.DataFrame:
+    """
+    dAliquota: uma linha por CHAVE_ALIQUOTA existente na fato ou na ponte.
+    Lê só COMPETENCIA e ALIQUOTA_ICMS dos Parquet da fato (leitura leve).
+    """
+    pares = [ponte[["COMPETENCIA", "ALIQUOTA_ICMS"]]]
+    fato_dir = saida_dir / "fato"
+    if fato_dir.exists():
+        for f in sorted(fato_dir.glob("fato_precos_*.parquet")):
+            pares.append(pd.read_parquet(f, columns=["COMPETENCIA", "ALIQUOTA_ICMS"]).drop_duplicates())
+    dim = pd.concat(pares, ignore_index=True).dropna().drop_duplicates()
+
+    dim["CHAVE_ALIQUOTA"] = [chave_aliquota(c, a) for c, a in zip(dim["COMPETENCIA"], dim["ALIQUOTA_ICMS"])]
+    dim["COMPETENCIA_DATA"] = dim["COMPETENCIA"] + "-01"
+    dim["ALIQUOTA_ICMS_PCT"] = dim["ALIQUOTA_ICMS"].map(pct_para_numero)
+
+    ufs = ponte.groupby("CHAVE_ALIQUOTA")["ESTADO_UF"].agg(lambda s: ", ".join(sorted(s)))
+    dim["UFS"] = dim["CHAVE_ALIQUOTA"].map(ufs).fillna("")
+    dim["QTD_UFS"] = dim["CHAVE_ALIQUOTA"].map(ponte["CHAVE_ALIQUOTA"].value_counts()).fillna(0).astype(int)
+
+    dim = dim[["CHAVE_ALIQUOTA", "COMPETENCIA", "COMPETENCIA_DATA", "ALIQUOTA_ICMS",
+               "ALIQUOTA_ICMS_PCT", "QTD_UFS", "UFS"]]
+    return dim.sort_values(["COMPETENCIA", "ALIQUOTA_ICMS_PCT"], na_position="first").reset_index(drop=True)
+
+
 def descobrir_horizonte(saida_dir: Path) -> date:
     """Horizonte = o mais recente entre hoje e a última competência já existente na fato."""
     hoje = date.today()
@@ -216,9 +265,18 @@ def main():
     hist.to_csv(f_hist, index=False, encoding="utf-8-sig")
     grade.to_csv(f_grade, index=False, encoding="utf-8-sig")
 
+    ponte = montar_ponte(grade)
+    dim = montar_dim_aliquota(ponte, saida)
+    f_ponte = saida / "ponte_aliquota_estado.csv"
+    f_dim = saida / "dim_aliquota.csv"
+    ponte.to_csv(f_ponte, index=False, encoding="utf-8-sig")
+    dim.to_csv(f_dim, index=False, encoding="utf-8-sig")
+
     n_mudancas = int(grade["MUDOU"].sum())
     logging.info(f"OK  →  {f_hist.name}: {len(hist)} períodos de vigência")
     logging.info(f"OK  →  {f_grade.name}: {len(grade)} linhas (UF × mês), {n_mudancas} mudança(s) registrada(s)")
+    logging.info(f"OK  →  {f_ponte.name}: {len(ponte)} linhas (alíquota × UF)")
+    logging.info(f"OK  →  {f_dim.name}: {len(dim)} chaves de alíquota")
 
 
 if __name__ == "__main__":

@@ -908,6 +908,26 @@ def detectar_colunas_preco(df: pd.DataFrame, tipo_preco: str) -> list:
             encontradas.append(col)
     return encontradas
 
+def chave_aliquota(competencia: str, aliquota: str) -> str:
+    """Chave alíquota × competência (ex.: '2026-09|20,5%').
+
+    Liga a fato à dAliquota. A competência entra na chave porque a alíquota
+    de cada UF muda ao longo do tempo: a ponte diz quais UFs usavam cada
+    alíquota NAQUELE mês. Mesma regra de gerar_historico_aliquotas.py.
+    """
+    return f"{competencia}|{aliquota}"
+
+
+# Ordem fixa das colunas do Parquet da fato (o Power BI combina a pasta
+# pelo esquema do primeiro arquivo, então todos os meses seguem esta ordem).
+COLUNAS_FATO = [
+    "EAN", "CODIGO_GGREM", "PRODUTO", "APRESENTACAO", "LABORATORIO",
+    "SUBSTANCIA", "TIPO_PRECO", "ALIQUOTA_ICMS", "ALIQUOTA_ICMS_PCT",
+    "CHAVE_ALIQUOTA", "VALOR", "FLAG_ASTERISCO", "EAN_INVALIDO",
+    "COMPETENCIA", "COMPETENCIA_DATA", "DATA_REFERENCIA", "DATA_CARGA",
+]
+
+
 def processar_tabela_precos(
     df: pd.DataFrame,
     caminho: Path,
@@ -972,32 +992,26 @@ def processar_tabela_precos(
 
                 flag_ast = row.get(f"_FLAG_{col_preco}", False)
 
-                # Mapear alíquota → UFs
-                ufs = MAPEAMENTO_ICMS_UF.get(aliquota, [])
-
-                if not ufs:
-                    # Se não há mapeamento (ex: "Sem Impostos" ou alíquota nova),
-                    # gerar linha sem UF específica
-                    ufs = [None]
-
-                for uf in ufs:
-                    registros.append({
-                        "EAN": ean,
-                        "CODIGO_GGREM": row.get("CÓDIGO GGREM"),
-                        "PRODUTO": row.get("PRODUTO"),
-                        "APRESENTACAO": row.get("APRESENTAÇÃO"),
-                        "LABORATORIO": row.get("LABORATÓRIO"),
-                        "SUBSTANCIA": row.get("SUBSTÂNCIA"),
-                        "TIPO_PRECO": tipo_preco,
-                        "ALIQUOTA_ICMS": aliquota,
-                        "ESTADO_UF": uf,
-                        "VALOR": valor,
-                        "FLAG_ASTERISCO": bool(flag_ast),
-                        "EAN_INVALIDO": not validar_ean13(ean) if ean else True,
-                        "COMPETENCIA": competencia,
-                        "DATA_REFERENCIA": competencia + "-01",
-                        "DATA_CARGA": data_carga.isoformat(),
-                    })
+                # Uma linha por alíquota, SEM UF. O vínculo com os estados é
+                # feito no Power BI pela chave CHAVE_ALIQUOTA, através de
+                # ponte_aliquota_estado.csv (gerada por gerar_historico_aliquotas.py).
+                registros.append({
+                    "EAN": ean,
+                    "CODIGO_GGREM": row.get("CÓDIGO GGREM"),
+                    "PRODUTO": row.get("PRODUTO"),
+                    "APRESENTACAO": row.get("APRESENTAÇÃO"),
+                    "LABORATORIO": row.get("LABORATÓRIO"),
+                    "SUBSTANCIA": row.get("SUBSTÂNCIA"),
+                    "TIPO_PRECO": tipo_preco,
+                    "ALIQUOTA_ICMS": aliquota,
+                    "CHAVE_ALIQUOTA": chave_aliquota(competencia, aliquota),
+                    "VALOR": valor,
+                    "FLAG_ASTERISCO": bool(flag_ast),
+                    "EAN_INVALIDO": not validar_ean13(ean) if ean else True,
+                    "COMPETENCIA": competencia,
+                    "DATA_REFERENCIA": competencia + "-01",
+                    "DATA_CARGA": data_carga.isoformat(),
+                })
 
     df_resultado = pd.DataFrame(registros)
     logging.info(
@@ -1174,6 +1188,7 @@ def exportar_para_powerbi(
                  .where(~_aliq.str.lower().str.startswith("sem")),
             errors="coerce",
         ) / 100
+        parte = parte[COLUNAS_FATO]
 
         caminho_parte = dir_fato / f"fato_precos_{comp}.parquet"
         # Sobrescreve o mês (idempotente entre as execuções do mesmo mês).
