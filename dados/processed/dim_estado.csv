@@ -1,11 +1,11 @@
 ﻿ESTADO_UF,NOME_ESTADO,REGIAO,ALIQUOTA_ICMS_VIGENTE,ALIQUOTA_ICMS_VIGENTE_PCT
 AC,Acre,Norte,19%,0.19
-AL,Alagoas,Nordeste,20%,0.2
+AL,Alagoas,Nordeste,"20,5%",0.205
 AM,Amazonas,Norte,20%,0.2
 AP,Amapá,Norte,18%,0.18
 BA,Bahia,Nordeste,"20,5%",0.205
 CE,Ceará,Nordeste,20%,0.2
-DF,Distrito Federal,Centro-Oeste,17%,0.17
+DF,Distrito Federal,Centro-Oeste,20%,0.2
 ES,Espírito Santo,Sudeste,17%,0.17
 GO,Goiás,Centro-Oeste,19%,0.19
 MA,Maranhão,Nordeste,23%,0.23

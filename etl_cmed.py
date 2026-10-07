@@ -92,10 +92,10 @@ def _carregar_mapeamento_icms(caminho=None, ref: str = None) -> dict:
     caminho = Path(caminho) if caminho else Path(__file__).with_name("aliquotas_icms.csv")
 
     _DEFAULT = {
-        "17%": ["DF", "ES", "MS", "MT", "RS", "SC"], "18%": ["AP", "MG", "SP"],
+        "17%": ["ES", "MS", "MT", "RS", "SC"], "18%": ["AP", "MG", "SP"],
         "19%": ["AC", "GO", "PA", "SE"], "19,5%": ["PR", "RO"],
-        "20%": ["AL", "AM", "CE", "PB", "RN", "RR", "TO"],
-        "20,5%": ["BA", "PE"], "22%": ["RJ"], "22,5%": ["PI"], "23%": ["MA"],
+        "20%": ["AM", "CE", "DF", "PB", "RN", "RR", "TO"],
+        "20,5%": ["AL", "BA", "PE"], "22%": ["RJ"], "22,5%": ["PI"], "23%": ["MA"],
     }
     if not caminho.exists():
         logging.warning(f"{caminho.name} não encontrado; usando mapeamento ICMS interno.")
