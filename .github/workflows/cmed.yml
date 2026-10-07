@@ -51,6 +51,13 @@ jobs:
           SMTP_DESTINATARIOS: ${{ secrets.SMTP_DESTINATARIOS }}
         run: python etl_cmed.py
 
+      # Recalcula dim_aliquota_historico.csv e fato_aliquota_mensal.csv a partir
+      # de aliquotas_icms.csv, para o histórico acompanhar a nova competência.
+      # Uma falha aqui não impede salvar os preços já processados.
+      - name: Gerar histórico de alíquotas
+        continue-on-error: true
+        run: python gerar_historico_aliquotas.py
+
       - name: Salvar arquivos gerados
         run: |
           git config user.name "github-actions[bot]"

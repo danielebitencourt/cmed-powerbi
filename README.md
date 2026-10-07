@@ -48,7 +48,8 @@ O workflow `ETL CMED Mensal` roda nos dias **1, 5, 10 e 15 de cada mês às 11:0
 A cada execução ele:
 1. Instala as dependências de `requirements.txt`.
 2. Executa `python etl_cmed.py`.
-3. Faz commit de `dados/processed/` e `.github/cmed/estado.json`, abortando se algum arquivo passar de 100 MB.
+3. Executa `python gerar_historico_aliquotas.py` (histórico de alíquotas).
+4. Faz commit de `dados/processed/` e `.github/cmed/estado.json`, abortando se algum arquivo passar de 100 MB.
 
 Para rodar manualmente: aba **Actions → ETL CMED Mensal → Run workflow**.
 
@@ -105,7 +106,7 @@ O script fecha automaticamente a vigência anterior e recalcula:
 - `dim_aliquota_historico.csv` — uma linha por período de vigência de cada UF (início, fim, vigente, fonte).
 - `fato_aliquota_mensal.csv` — grade mês × UF com a alíquota vigente; a coluna `MUDOU` marca o mês da mudança.
 
-> ⚠️ O workflow do GitHub Actions **não** executa `gerar_historico_aliquotas.py`. Sempre que alterar `aliquotas_icms.csv`, rode-o manualmente (passo 2).
+> O workflow do GitHub Actions executa `gerar_historico_aliquotas.py` em toda execução agendada. Rodar o passo 2 manualmente só é necessário para refletir a mudança no Power BI antes da próxima execução.
 
 ---
 
