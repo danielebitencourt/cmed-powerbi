@@ -6,7 +6,7 @@ Importação automática mensal dos preços oficiais de medicamentos da CMED/ANV
 
 ## Visão geral
 
-**Camada ETL (Python + GitHub Actions)** — o `etl_cmed.py` baixa os arquivos PMC e PF/PMVG do site da ANVISA, trata a qualidade dos dados (EAN, separadores decimais, asteriscos) e faz o unpivot para uma tabela fato com granularidade EAN × Tipo de Preço × Alíquota × Competência. A fato **não tem UF**: os estados se ligam a ela pela alíquota, através de uma tabela ponte. O GitHub Actions executa o script automaticamente e versiona o resultado neste repositório.
+**Camada ETL (Python + GitHub Actions)** — o `etl_cmed.py` baixa os arquivos PMC e PF/PMVG do site da ANVISA, trata a qualidade dos dados (EAN, separadores decimais, asteriscos) e faz o unpivot para uma tabela fato com granularidade Apresentação (GGREM × EAN) × Tipo de Preço × Alíquota × Competência. A fato guarda só **chaves** (`CHAVE_PRODUTO`, `CODIGO_GGREM`, `EAN`) e **medidas** (preço, regime de preço); as descrições ficam na `dim_medicamento`. A fato **não tem UF**: os estados se ligam a ela pela alíquota, através de uma tabela ponte. O GitHub Actions executa o script automaticamente e versiona o resultado neste repositório.
 
 **Camada analítica (Power BI)** — consome os arquivos de `dados/processed/` em um modelo estrela com as dimensões Medicamento, Estado e Calendário, mais as tabelas de histórico de alíquotas.
 
@@ -135,7 +135,7 @@ Os arquivos podem ser lidos de uma cópia local do repositório ou direto do Git
 
 | De | Para | Cardinalidade | Filtro cruzado |
 |---|---|---|---|
-| fCMED_Precos[EAN] | dMedicamento[EAN] | Muitos:1 | Único |
+| fCMED_Precos[CHAVE_PRODUTO] | dMedicamento[CHAVE_PRODUTO] | Muitos:1 | Único |
 | fCMED_Precos[CHAVE_ALIQUOTA] | dAliquota[CHAVE_ALIQUOTA] | Muitos:1 | Único |
 | fCMED_Precos[DATA_REFERENCIA] | dCalendario[DATA] | Muitos:1 | Único |
 | pAliquotaEstado[CHAVE_ALIQUOTA] | dAliquota[CHAVE_ALIQUOTA] | Muitos:1 | **Ambos** |
@@ -158,17 +158,19 @@ Os arquivos podem ser lidos de uma cópia local do repositório ou direto do Git
 ## Modelo de dados
 
 ```
-┌──────────────┐      ┌──────────────────┐      ┌──────────────┐
-│ dMedicamento │ 1  * │  fCMED_Precos    │ *  1 │ dCalendario  │
-│   EAN (PK)   │─────<│  EAN             │>─────│   DATA (PK)  │
-└──────────────┘      │  CHAVE_ALIQUOTA  │      └──────┬───────┘
-                      │  DATA_REFERENCIA │             │ 1
-                      │  TIPO_PRECO      │             │ *
-                      │  ALIQUOTA_ICMS   │    ┌────────┴─────────┐
-                      │  VALOR           │    │ fAliquotaMensal  │
-                      └────────┬─────────┘    │ COMPETENCIA_DATA │
-                               │ *            │ ESTADO_UF        │
-                               │ 1            └────────┬─────────┘
+┌────────────────┐    ┌──────────────────┐      ┌──────────────┐
+│  dMedicamento  │ 1 *│  fCMED_Precos    │ *  1 │ dCalendario  │
+│ CHAVE_PRODUTO  │───<│  CHAVE_PRODUTO   │>─────│   DATA (PK)  │
+│   (PK=GGREM|EAN)│   │  CODIGO_GGREM    │      └──────┬───────┘
+│  GGREM, EAN,   │    │  EAN             │             │ 1
+│  REGISTRO...   │    │  TIPO_PRECO      │             │ *
+└────────────────┘    │  REGIME_PRECO    │    ┌────────┴─────────┐
+                      │  ALIQUOTA_ICMS   │    │ fAliquotaMensal  │
+                      │  CHAVE_ALIQUOTA  │    │ COMPETENCIA_DATA │
+                      │  VALOR           │    │ ESTADO_UF        │
+                      └────────┬─────────┘    └────────┬─────────┘
+                               │ *                     │ *
+                               │ 1                     │
                       ┌────────┴─────────┐             │ *
                       │    dAliquota     │             │
                       │ CHAVE_ALIQUOTA PK│             │
@@ -192,8 +194,11 @@ Os arquivos podem ser lidos de uma cópia local do repositório ou direto do Git
 
 | Coluna | Descrição |
 |---|---|
-| `EAN` | EAN-13 tratado |
+| `CHAVE_PRODUTO` | `GGREM\|EAN` — liga à `dim_medicamento` (relação do Power BI) |
+| `CODIGO_GGREM` | Código GGREM da apresentação (chave única na CMED) |
+| `EAN` | EAN-13 tratado (código de barras; 1 GGREM pode ter até 3) |
 | `TIPO_PRECO` | `PMC` ou `PF` |
+| `REGIME_PRECO` | `Regulado` ou `Liberado`, conforme a lista (PMC/PF) daquela competência |
 | `ALIQUOTA_ICMS` / `ALIQUOTA_ICMS_PCT` | Alíquota em texto (`20,5%`) e em número (`0,205`) |
 | `CHAVE_ALIQUOTA` | `AAAA-MM\|alíquota` — liga à dAliquota (e, pela ponte, aos estados) |
 | `VALOR` | Preço em R$ |
@@ -201,6 +206,8 @@ Os arquivos podem ser lidos de uma cópia local do repositório ou direto do Git
 | `FLAG_ASTERISCO` | Valor veio com `*` na planilha da CMED |
 | `EAN_INVALIDO` | Dígito verificador do EAN não confere |
 | `DATA_CARGA` | Data e hora do processamento |
+
+As descrições (`PRODUTO`, `APRESENTACAO`, `LABORATORIO`, `SUBSTANCIA`, `REGISTRO`, `CLASSE_TERAPEUTICA`, `TARJA`, `TIPO_PRODUTO`, `CNPJ`...) ficam na `dim_medicamento`, uma linha por `CHAVE_PRODUTO`.
 
 ---
 

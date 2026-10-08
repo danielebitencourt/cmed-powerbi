@@ -908,6 +908,20 @@ def detectar_colunas_preco(df: pd.DataFrame, tipo_preco: str) -> list:
             encontradas.append(col)
     return encontradas
 
+def normalizar_ggrem(valor) -> Optional[str]:
+    """Normaliza o CÓDIGO GGREM para casar fato × dim_medicamento.
+
+    A CMED às vezes grava o GGREM como número (ex.: '523516030028116.0'):
+    remove o '.0' final e espaços. Texto puro passa inalterado.
+    """
+    if valor is None or (isinstance(valor, float) and np.isnan(valor)):
+        return None
+    s = str(valor).strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s or None
+
+
 def chave_aliquota(competencia: str, aliquota: str) -> str:
     """Chave alíquota × competência (ex.: '2026-09|20,5%').
 
@@ -920,12 +934,29 @@ def chave_aliquota(competencia: str, aliquota: str) -> str:
 
 # Ordem fixa das colunas do Parquet da fato (o Power BI combina a pasta
 # pelo esquema do primeiro arquivo, então todos os meses seguem esta ordem).
+# A fato guarda só CHAVES e MEDIDAS. A ligação com a dim_medicamento é pela
+# CHAVE_PRODUTO = 'GGREM|EAN' (o Power BI relaciona por uma coluna só);
+# CODIGO_GGREM e EAN ficam também soltos para filtro. Os atributos descritivos
+# (produto, apresentação, laboratório, substância...) ficam só na dim.
+# REGIME_PRECO fica aqui, por base (PMC/PF), pois é informado em cada lista.
 COLUNAS_FATO = [
-    "EAN", "CODIGO_GGREM", "PRODUTO", "APRESENTACAO", "LABORATORIO",
-    "SUBSTANCIA", "TIPO_PRECO", "ALIQUOTA_ICMS", "ALIQUOTA_ICMS_PCT",
-    "CHAVE_ALIQUOTA", "VALOR", "FLAG_ASTERISCO", "EAN_INVALIDO",
+    "CHAVE_PRODUTO", "CODIGO_GGREM", "EAN", "TIPO_PRECO", "REGIME_PRECO",
+    "ALIQUOTA_ICMS", "ALIQUOTA_ICMS_PCT", "CHAVE_ALIQUOTA",
+    "VALOR", "FLAG_ASTERISCO", "EAN_INVALIDO",
     "COMPETENCIA", "COMPETENCIA_DATA", "DATA_REFERENCIA", "DATA_CARGA",
 ]
+
+
+def chave_produto(ggrem, ean) -> Optional[str]:
+    """Chave da apresentação × código de barras: 'GGREM|EAN'.
+
+    Liga a fato à dim_medicamento. Usa GGREM + EAN porque o mesmo EAN pode
+    aparecer em produtos diferentes e um GGREM pode ter até 3 EANs.
+    """
+    g = normalizar_ggrem(ggrem)
+    if g is None:
+        return None
+    return f"{g}|{ean or ''}"
 
 
 def processar_tabela_precos(
@@ -995,14 +1026,16 @@ def processar_tabela_precos(
                 # Uma linha por alíquota, SEM UF. O vínculo com os estados é
                 # feito no Power BI pela chave CHAVE_ALIQUOTA, através de
                 # ponte_aliquota_estado.csv (gerada por gerar_historico_aliquotas.py).
+                _ggrem = normalizar_ggrem(row.get("CÓDIGO GGREM"))
                 registros.append({
+                    "CHAVE_PRODUTO": chave_produto(_ggrem, ean),
+                    "CODIGO_GGREM": _ggrem,
                     "EAN": ean,
-                    "CODIGO_GGREM": row.get("CÓDIGO GGREM"),
-                    "PRODUTO": row.get("PRODUTO"),
-                    "APRESENTACAO": row.get("APRESENTAÇÃO"),
-                    "LABORATORIO": row.get("LABORATÓRIO"),
-                    "SUBSTANCIA": row.get("SUBSTÂNCIA"),
                     "TIPO_PRECO": tipo_preco,
+                    # REGIME DE PREÇO é informado por lista (PMC/PF). Fica na
+                    # fato para refletir cada base; os demais atributos do
+                    # medicamento ficam na dim.
+                    "REGIME_PRECO": row.get("REGIME DE PREÇO"),
                     "ALIQUOTA_ICMS": aliquota,
                     "CHAVE_ALIQUOTA": chave_aliquota(competencia, aliquota),
                     "VALOR": valor,
@@ -1026,12 +1059,18 @@ def processar_tabela_precos(
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def gerar_dimensao_medicamento(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """Gera tabela dimensão dMedicamento a partir do DataFrame original."""
+def gerar_dimensao_medicamento(*dfs_raw: pd.DataFrame) -> pd.DataFrame:
+    """Gera a dim_medicamento com CHAVE = CHAVE_PRODUTO ('GGREM|EAN').
 
-    cols_dim = {
-        "EAN 1": "EAN",
-        "CÓDIGO GGREM": "CODIGO_GGREM",
+    Recebe uma ou mais listas brutas (PMC e PF) e usa a união, empilhando os
+    EANs 1/2/3 de cada apresentação (GGREM), para que toda CHAVE_PRODUTO da fato
+    — venha de PMC ou de PF — tenha produto correspondente.
+
+    REGIME_PRECO NÃO fica aqui: vai para a fato, pois é informado por base
+    (PMC/PF) em cada lista da CMED.
+    """
+    attr = {
+        "REGISTRO": "REGISTRO",
         "PRODUTO": "PRODUTO",
         "APRESENTAÇÃO": "APRESENTACAO",
         "SUBSTÂNCIA": "SUBSTANCIA",
@@ -1039,46 +1078,56 @@ def gerar_dimensao_medicamento(df_raw: pd.DataFrame) -> pd.DataFrame:
         "CNPJ": "CNPJ",
         "CLASSE TERAPÊUTICA": "CLASSE_TERAPEUTICA",
         "F.FARMACÊUTICA": "F_FARMACEUTICA",
-        "REGIME DE PREÇO": "REGIME_PRECO",
         "TARJA": "TARJA",
         "RESTRIÇÃO HOSPITALAR": "RESTRICAO_HOSPITALAR",
         "CAP": "CAP",
         "TIPO DE PRODUTO (STATUS DO PRODUTO)": "TIPO_PRODUTO",
     }
 
-    # Colunas de atributo (todas menos as de EAN) presentes no arquivo
-    attr_map = {k: v for k, v in cols_dim.items()
-                if k != "EAN 1" and k in df_raw.columns}
-
-    # Empilhar EAN 1/2/3 numa única coluna EAN. O fato explode os três
-    # códigos de barras; se a dimensão usar só "EAN 1", ~4,5% das linhas do
-    # fato ficam sem produto correspondente. Empilhando, todo EAN do fato
-    # tem match na dimensão.
+    cols = ["CHAVE_PRODUTO", "CODIGO_GGREM", "EAN"] + list(attr.values())
     frames = []
-    for col_ean in ("EAN 1", "EAN 2", "EAN 3"):
-        if col_ean in df_raw.columns:
-            tmp = df_raw[[col_ean] + list(attr_map.keys())].copy()
-            tmp.rename(columns={col_ean: "EAN", **attr_map}, inplace=True)
-            frames.append(tmp)
-    df_dim = pd.concat(frames, ignore_index=True) if frames else df_raw.iloc[0:0].copy()
+    for df_raw in dfs_raw:
+        if "CÓDIGO GGREM" not in df_raw.columns:
+            continue
+        presentes = {k: v for k, v in attr.items() if k in df_raw.columns}
+        eans_cols = [c for c in ("EAN 1", "EAN 2", "EAN 3") if c in df_raw.columns]
+        base = df_raw[["CÓDIGO GGREM"] + eans_cols + list(presentes.keys())].copy()
+        base.rename(columns={"CÓDIGO GGREM": "CODIGO_GGREM", **presentes}, inplace=True)
+        base["CODIGO_GGREM"] = base["CODIGO_GGREM"].apply(normalizar_ggrem)
+        base = base[base["CODIGO_GGREM"].notna()]
+        for c in eans_cols:
+            base[c] = base[c].apply(tratar_ean)
+        attrs = list(presentes.values())
+        # Uma linha por EAN válido (empilha EAN 1/2/3).
+        for c in eans_cols:
+            sub = base.loc[base[c].notna(), ["CODIGO_GGREM", c] + attrs].rename(columns={c: "EAN"})
+            frames.append(sub)
+        # GGREM sem NENHUM EAN válido: uma linha com EAN vazio, para casar com a
+        # linha 'GGREM|' que a fato gera nesses casos (sem órfãos).
+        sem = base.loc[base[eans_cols].isna().all(axis=1), ["CODIGO_GGREM"] + attrs].copy() \
+            if eans_cols else base[["CODIGO_GGREM"] + attrs].copy()
+        sem["EAN"] = ""
+        frames.append(sem)
 
-    # Tratar EAN
-    if "EAN" in df_dim.columns:
-        df_dim["EAN"] = df_dim["EAN"].apply(tratar_ean)
+    if not frames:
+        return pd.DataFrame(columns=cols)
 
-    # Deduplica por EAN (mantém primeiro registro)
-    df_dim.dropna(subset=["EAN"], inplace=True)
-    df_dim.drop_duplicates(subset=["EAN"], keep="first", inplace=True)
+    df_dim = pd.concat(frames, ignore_index=True)
+    df_dim["EAN"] = df_dim["EAN"].fillna("")
+    df_dim["CHAVE_PRODUTO"] = df_dim["CODIGO_GGREM"] + "|" + df_dim["EAN"]
+    # 1ª base (PMC) e 1ª ocorrência têm prioridade na deduplicação.
+    df_dim.drop_duplicates(subset=["CHAVE_PRODUTO"], keep="first", inplace=True)
 
-    # Converter restrição hospitalar para booleano
     if "RESTRICAO_HOSPITALAR" in df_dim.columns:
         df_dim["RESTRICAO_HOSPITALAR"] = df_dim["RESTRICAO_HOSPITALAR"].apply(
             lambda x: str(x).strip().upper() in ("SIM", "S", "TRUE", "1", "X")
             if pd.notna(x) else False
         )
 
-    df_dim.reset_index(drop=True, inplace=True)
-    logging.info(f"Dimensão medicamento: {len(df_dim)} produtos únicos por EAN.")
+    # reindex (não [cols]): o layout da CMED varia — algumas listas não trazem
+    # F.FARMACÊUTICA/CAP. Colunas ausentes entram vazias, mantendo esquema estável.
+    df_dim = df_dim.reindex(columns=cols).reset_index(drop=True)
+    logging.info(f"Dimensão medicamento: {len(df_dim)} apresentações (GGREM × EAN).")
     return df_dim
 
 
@@ -1203,7 +1252,8 @@ def exportar_para_powerbi(
     if caminho_med.exists():
         df_med_existente = pd.read_csv(caminho_med, dtype=str, encoding=encoding)
         df_medicamento = pd.concat([df_med_existente, df_medicamento], ignore_index=True)
-        df_medicamento.drop_duplicates(subset=["EAN"], keep="last", inplace=True)
+        # keep="last": o cadastro mais recente (deste mês) prevalece sobre o antigo.
+        df_medicamento.drop_duplicates(subset=["CHAVE_PRODUTO"], keep="last", inplace=True)
     df_medicamento.to_csv(caminho_med, index=False, encoding=encoding)
     arquivos["dim_medicamento"] = caminho_med
 
@@ -1276,8 +1326,8 @@ def main():
         df_fato = pd.concat([df_fato_pmc, df_fato_pf], ignore_index=True)
         logging.info(f"Tabela fato combinada: {len(df_fato)} registros.")
 
-        # 6. Dimensões
-        df_medicamento = gerar_dimensao_medicamento(df_raw_pmc)
+        # 6. Dimensões (dim_medicamento a partir de PMC + PF, chave GGREM)
+        df_medicamento = gerar_dimensao_medicamento(df_raw_pmc, df_raw_pf)
         df_estado = gerar_dimensao_estado()
         df_calendario = gerar_dimensao_calendario()
 
