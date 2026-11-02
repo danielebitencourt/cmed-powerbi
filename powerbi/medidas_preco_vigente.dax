@@ -1,0 +1,60 @@
+// ═══════════════════════════════════════════════════════════════════════
+// Medidas de preço CMED para o Power BI  (tabela: fato_precos)
+//
+// POR QUE EXISTEM
+// A fato tem UMA linha por GGREM × EAN × Tipo (PF/PMC) × Alíquota × Competência.
+// Arrastar o campo VALOR para um visual cria "Média de VALOR" ou "Soma de VALOR",
+// que agregam TODAS as competências (meses) do filtro. Resultado: um preço que
+// não existe em nenhuma lista CMED. Em 02/11/2026 o visual de preços mostrava a
+// média de mar/2025–set/2026: 1.232 de 1.232 células erradas (−0,5% a −3,6%).
+//
+// REGRA: no visual, use SEMPRE [Preço CMED Vigente] (ou [PF Vigente]/[PMC Vigente]).
+// Nunca use VALOR solto (Média/Soma) nem as medidas antigas [PF]/[PMC] (SUM).
+//
+// Validado contra a lista oficial CMED: 1.232/1.232 células corretas.
+// ═══════════════════════════════════════════════════════════════════════
+
+// Preço oficial da competência MAIS RECENTE dentro do filtro de data.
+// - Linhas: produto/EAN. Colunas: TIPO_PRECO e ALIQUOTA_ICMS.
+// - Fica vazio quando a célula mistura preços diferentes (ex.: subtotal de
+//   vários produtos), para nunca mostrar um número inexistente na CMED.
+MEASURE fato_precos[Preço CMED Vigente] =
+VAR _ultima =
+    CALCULATE (
+        MAX ( fato_precos[COMPETENCIA_DATA] ),
+        REMOVEFILTERS (
+            fato_precos[EAN], fato_precos[GGREM], fato_precos[CHAVE_PRODUTO],
+            fato_precos[TIPO_PRECO], fato_precos[ALIQUOTA_ICMS], fato_precos[ALIQUOTA_ICMS_PCT],
+            fato_precos[CHAVE_ALIQUOTA], fato_precos[REGIME_PRECO]
+        ),
+        REMOVEFILTERS ( 'dm. PRODUTOS' ),
+        REMOVEFILTERS ( dim_medicamento ),
+        REMOVEFILTERS ( dim_molecula_cas )
+    )
+VAR _valores =
+    CALCULATETABLE ( DISTINCT ( fato_precos[VALOR] ), fato_precos[COMPETENCIA_DATA] = _ultima )
+RETURN
+    IF ( COUNTROWS ( _valores ) = 1, MAXX ( _valores, fato_precos[VALOR] ) )
+
+MEASURE fato_precos[PF Vigente] =
+    CALCULATE ( [Preço CMED Vigente], fato_precos[TIPO_PRECO] = "PF" )
+
+MEASURE fato_precos[PMC Vigente] =
+    CALCULATE ( [Preço CMED Vigente], fato_precos[TIPO_PRECO] = "PMC" )
+
+// Mostra qual lista CMED (AAAA-MM) o visual está exibindo. Use num cartão.
+MEASURE fato_precos[Competência Vigente] =
+VAR _ultima =
+    CALCULATE (
+        MAX ( fato_precos[COMPETENCIA_DATA] ),
+        REMOVEFILTERS (
+            fato_precos[EAN], fato_precos[GGREM], fato_precos[CHAVE_PRODUTO],
+            fato_precos[TIPO_PRECO], fato_precos[ALIQUOTA_ICMS], fato_precos[ALIQUOTA_ICMS_PCT],
+            fato_precos[CHAVE_ALIQUOTA], fato_precos[REGIME_PRECO]
+        ),
+        REMOVEFILTERS ( 'dm. PRODUTOS' ),
+        REMOVEFILTERS ( dim_medicamento ),
+        REMOVEFILTERS ( dim_molecula_cas )
+    )
+RETURN
+    FORMAT ( _ultima, "yyyy-MM" )
