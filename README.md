@@ -148,6 +148,23 @@ Os arquivos podem ser lidos de uma cópia local do repositório ou direto do Git
 
 **Por que a chave inclui a competência:** a alíquota de uma UF muda com o tempo. `2026-09|20%` liga os preços de 20% de setembro às UFs que usavam 20% *em setembro*; se em 2027 SP passar para 20%, os meses antigos continuam corretos.
 
+### Medidas de preço (obrigatório)
+
+> **Nunca coloque o campo `VALOR` direto no visual** ("Média de VALOR" / "Soma de VALOR") e não use as medidas antigas `[PF]`/`[PMC]` (que fazem `SUM`). Elas agregam **todas as competências** do filtro e mostram um preço que não existe em nenhuma lista CMED. Em 02/11/2026 isso fazia o visual de preços mostrar a média de mar/2025–set/2026: **1.232 de 1.232 células erradas** (de −0,5% a −3,6%).
+
+Use as medidas de [`powerbi/medidas_preco_vigente.dax`](powerbi/medidas_preco_vigente.dax):
+
+| Medida | Uso |
+|---|---|
+| `[Preço CMED Vigente]` | Valor do visual com `TIPO_PRECO` e `ALIQUOTA_ICMS` nas colunas. Pega só a competência mais recente do filtro; fica vazia se a célula misturar preços diferentes (ex.: subtotal de vários produtos) |
+| `[PF Vigente]` / `[PMC Vigente]` | Mesmo cálculo, fixando o tipo de preço |
+| `[Competência Vigente]` | Cartão que mostra qual lista CMED (AAAA-MM) está na tela |
+
+Cuidados no relatório:
+- **Atualize o Power BI** depois de cada execução do ETL (dia 1/5/10/15). Sem atualizar, o modelo fica na lista anterior.
+- O filtro de data **"Último 1 mês (calendário)"** exclui o mês corrente; quando a lista nova é publicada, o visual continua no mês anterior. Prefira **"Este mês"** ou deixe sem filtro de data (a medida já pega a competência mais recente).
+- Para conferir o que o Power BI está mostrando: `python validacao/validar_powerbi.py --csv export.csv --competencia AAAA-MM` (instruções no cabeçalho do script).
+
 **Comportamento esperado:**
 - Filtrando uma UF, aparecem os preços da alíquota dela naquele mês.
 - Filtrando várias UFs com a mesma alíquota, cada preço aparece **uma vez** (não é duplicado por estado).
