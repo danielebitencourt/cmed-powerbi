@@ -1,0 +1,77 @@
+{
+  "competencia_validada": "2026-10",
+  "links_oficiais": {
+    "PMC": "https://www.gov.br/anvisa/pt-br/assuntos/medicamentos/cmed/precos/arquivos/lista_pmc__20261009_115232673.xlsx/@@download/file",
+    "PF": "https://www.gov.br/anvisa/pt-br/assuntos/medicamentos/cmed/precos/arquivos/lista_pmvg__20261009_115232673.xlsx/@@download/file"
+  },
+  "arquivos": {
+    "PMC": {
+      "aba": "Lista PMC",
+      "linha_cabecalho": 1,
+      "colunas_preco": [
+        "PMC SEM IMPOSTOS",
+        "PMC 0%",
+        "PMC 12%",
+        "PMC 17%",
+        "PMC 17,5%",
+        "PMC 18%",
+        "PMC 19%",
+        "PMC 19,5%",
+        "PMC 20%",
+        "PMC 20,5%",
+        "PMC 21%",
+        "PMC 22%",
+        "PMC 22,5%",
+        "PMC 23%"
+      ],
+      "tipos_celula": {
+        "texto": 317436,
+        "texto_vazio": 55440
+      },
+      "arquivo": "lista_PMC__20261009_115232673.xlsx",
+      "competencia_no_nome": "2026-10",
+      "sha256": "d36148255b4529241b564c6df2e1fdd40e4f37d1d75806bc9a0f1f767aa12019",
+      "celulas": 333354
+    },
+    "PF": {
+      "aba": "Lista PMVG",
+      "linha_cabecalho": 1,
+      "colunas_preco": [
+        "PF SEM IMPOSTOS",
+        "PF 0%",
+        "PF 12%",
+        "PF 17%",
+        "PF 17,5%",
+        "PF 18%",
+        "PF 19%",
+        "PF 19,5%",
+        "PF 20%",
+        "PF 20,5%",
+        "PF 21%",
+        "PF 22%",
+        "PF 22,5%",
+        "PF 23%"
+      ],
+      "tipos_celula": {
+        "texto": 372876
+      },
+      "arquivo": "lista_PMVG__20261009_115232673.xlsx",
+      "competencia_no_nome": "2026-10",
+      "sha256": "6ac86b29e7146b01cdcf94a5a8d2f59e1db5ea6f5057663b71f59d20c0daca49",
+      "celulas": 390502
+    }
+  },
+  "duplicidades_oficial": 0,
+  "duplicidades_repo": 0,
+  "celulas_oficial": 723856,
+  "celulas_repo": 723856,
+  "celulas_comparadas": 723856,
+  "celulas_iguais": 723856,
+  "celulas_valor_divergente": 0,
+  "faltando_no_repo": 0,
+  "sobrando_no_repo": 0,
+  "assertividade_pct": 100.0,
+  "divergentes_por_tipo_aliq": {},
+  "faltando_por_tipo_aliq": {},
+  "sobrando_por_tipo_aliq": {}
+}
